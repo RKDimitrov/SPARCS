@@ -56,7 +56,7 @@ def plot_detections(img, centroids, save_path='detected_stars.png'):
     print(f"Plot saved to {save_path}")
 
 # Usage: Replace with your image path
-image_path = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\SPARCS\SPARCS\stellarium\image2.png"  # Your Stellarium image
+image_path = './stellarium/image2.png'  # Relative path for cross-platform use. Change if your image is elsewhere.
 img = load_image(image_path)
 centroids, intensities = detect_stars(img)
 
