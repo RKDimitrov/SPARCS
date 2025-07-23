@@ -64,7 +64,7 @@ def angular_distance(v1, v2):
     dot = np.dot(v1, v2)
     return np.arccos(np.clip(dot, -1, 1))
 
-MAX_ANGLE_DEG = 30  # Field of View threshold in degrees of camera
+MAX_ANGLE_DEG = 70# Field of View threshold in degrees of camera
 MAX_ANGLE_RAD = np.deg2rad(MAX_ANGLE_DEG)
 
 # Build KDTree for fast neighbor search in 3D space
@@ -123,7 +123,7 @@ def normal_coefficient(coords):
 
 ##STEP 6 - loop over local triads formed from neighbors within FoV using KDTree, calculate properties and store
 properties = []
-max_triads = 5000000  # Just starting test
+max_triads = 50000  # Just starting test
 seen_triads = set()
 
 for i, v in enumerate(vectors):
@@ -181,6 +181,7 @@ for i, v in enumerate(vectors):
 ## STEP 7 - Convert to DataFrame
 
 triad_df = pd.DataFrame(properties)
+triad_df.to_csv("triads_from_starRecognition.csv", index=False)
 print(triad_df.head())
 
 
