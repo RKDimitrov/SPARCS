@@ -15,23 +15,6 @@ A compact star tracker system that uses computer vision to recognize stars and d
 - **Hardware**: Raspberry Pi 4 with Raspberry Pi AI camera and BNO055 IMU sensor  
 - **Image Processing**: AI camera captures star field images and processes them locally on the Pi  
 - **Sensor Fusion**: Star data is combined with IMU readings to improve orientation accuracy  
-- **Modular Architecture**: Separate modules for image capture, star detection # S.P.A.R.C.S  
-**Space Pointing Attitude Recognition Control System**
-
-## Team Members
-- Kiiran (Team Leader)  
-- Mubi  
-- Fabrizio  
-- Dario  
-- Radoslav  
-
-## Goal  
-A compact star tracker system that uses computer vision to recognize stars and determine spacecraft attitude.
-
-## Current Design Decisions
-- **Hardware**: Raspberry Pi 4 with Raspberry Pi AI camera and BNO055 IMU sensor  
-- **Image Processing**: AI camera captures star field images and processes them locally on the Pi  
-- **Sensor Fusion**: Star data is combined with IMU readings to improve orientation accuracy  
 - **Modular Architecture**: Separate modules for image capture, star detection from the image, combination between star pairs from the star catalog, combination between stars from the image, matching between the two pairs and finally using Quest method to calculate the attitude.
 
 ## Open Questions
