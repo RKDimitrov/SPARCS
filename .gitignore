@@ -3,3 +3,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.npy
+
+# Ignore output and intermediate files in any subdirectory
+**/detected_star_properties*.csv
+**/star*-vectors.csv
+**/matched_stars.csv
+**/debug_detected_stars_30fov__n2.png
+**/grayscale_30fov_n2.png
+**/triads_from_starRecognition.csv
+**/triad_properties.csv
+**.detected-star-properties.csv
