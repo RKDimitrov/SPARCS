@@ -2,11 +2,11 @@
 **Space Pointing Attitude Recognition Control System**
 
 ## Team Members
-- Kiiran (Team Leader)  
-- Mubi  
-- Fabrizio  
-- Dario  
-- Radoslav  
+- Kiiran Jadhav (Team Leader)  
+- Mubasshirah Khan
+- Fabrizio Marin
+- Dario Maione
+- Radoslav Dimitrov
 
 ## Goal  
 A compact star tracker system that uses computer vision to recognize stars and determine spacecraft attitude.
