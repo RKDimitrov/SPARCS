@@ -6,6 +6,8 @@ __pycache__/
 *.npy
 
 # Ignore output and intermediate files in any subdirectory
+
+
 **/detected_star_properties*.csv
 **/star*-vectors.csv
 **/matched_stars.csv
@@ -14,3 +16,7 @@ __pycache__/
 **/triads_from_starRecognition.csv
 **/triad_properties.csv
 **.detected-star-properties.csv
+
+# Ignore all files in outputs/ but keep the folder
+src/outputs/*
+!src/outputs/.gitkeep
