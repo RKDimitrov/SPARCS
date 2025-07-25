@@ -67,4 +67,4 @@ A compact star tracker system that uses computer vision to recognize stars and d
 
 ## License
 
-[MIT](https://choosealicense.com/licenses/mit/)from the image, combination between star pairs from the star catalog, combination between stars from the image, matching between the two pairs and finally using Quest method to calculate the attitude.
+[MIT](https://choosealicense.com/licenses/mit/)
