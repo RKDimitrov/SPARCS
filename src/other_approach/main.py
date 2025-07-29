@@ -10,7 +10,7 @@ from utils.io import print_matched_stars, save_matched_stars_to_csv
 IMAGE_PATH = "../images/MatchingImage.png"
 CATALOG_PATH = "../HipparcosCatalog.txt"
 OUTPUT_MATCHED_CSV = "../outputs/matched_stars.csv"
-FOV_DEG = 69.9
+FOV_DEG = 66.9
 
 
 def main():
