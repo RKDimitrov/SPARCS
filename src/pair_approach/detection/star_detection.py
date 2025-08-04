@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter, label, center_of_mass
 
-def detect_stars(img, sigma_thresh=3.0, min_size=2, max_stars=20):
+def detect_stars(img, sigma_thresh=3.0, min_size=2, max_stars=30):
     """Detect star centroids and intensities in a grayscale image."""
     blurred = gaussian_filter(img, sigma=1.0)
     bg = np.median(blurred)

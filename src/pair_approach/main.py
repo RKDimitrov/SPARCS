@@ -8,6 +8,8 @@ from pair_approach.catalog.catalog_vectorizer import get_catalog_vectors_and_ids
 from pair_approach.matching.pair_matching import pair_angle_matching_with_ids
 from pair_approach.utils.io import save_vectors_to_csv
 from attitude_determination.compute import calculate_attitude, print_results
+from pair_approach.matching.ransac_attitude import ransac_refine_matches
+
 
 # --- CONFIG ---
 IMAGE_PATH = os.path.join(os.path.dirname(__file__), '../images/MatchingImage4.png')
@@ -35,6 +37,7 @@ def main():
 
     # 3. Load catalog and process
     hip = load_hipparcos_catalog(CATALOG_PATH)
+    catalog_vmag = hip['vmag'].to_numpy()
     print("Catalog columns:", hip.columns.tolist())
     hip = add_catalog_unit_vectors(hip)
     catalog_vectors, catalog_ids = get_catalog_vectors_and_ids(hip, id_col='name')
@@ -42,7 +45,17 @@ def main():
 
 
     # 4. Match detected stars to catalog
-    matches = pair_angle_matching_with_ids(catalog_vectors, catalog_ids, star_vectors, max_fov_deg=FOV_DEG)
+    #matches = pair_angle_matching_with_ids(catalog_vectors, catalog_ids, star_vectors, max_fov_deg=FOV_DEG)
+
+    matches = pair_angle_matching_with_ids(
+        catalog_vectors=catalog_vectors,
+        catalog_ids=catalog_ids,
+        image_vectors=star_vectors,
+        intensities=intensities,
+        catalog_vmag=catalog_vmag,
+        max_fov_deg=FOV_DEG
+    )
+
     print("\nStar Matches:")
     for match in matches:
         print(f"Image star {match['image_star_index']} matched to catalog star {match['catalog_star_id']} (votes: {match['votes']})")
@@ -51,19 +64,46 @@ def main():
 
     # 4b. Triad‐based refinement to prune outliers
     from pair_approach.matching.pair_matching import triad_refinement
-    refined = triad_refinement(
-        image_vectors=star_vectors,
-        catalog_vectors=catalog_vectors,
-        initial_matches=matches,
-        side_tol_deg=0.1,      # ~180″ tolerance in sides
-        angle_tol_deg=2.0,      # 1° tolerance in triad angle
-        vote_threshold=1        # at least two consistent triangles
-    )
-    print(f"\nRefined matches (after triad consistency): {len(refined)} kept")
-    for m in refined:
-        print(f"  Img {m['image_star_index']} → HIP {m['catalog_star_id']} "
-              f"(pairs={m['votes']}, triads={m['triad_votes']})")
+    refined = []
+    if len(matches) >= 3:
+        refined = triad_refinement(
+            image_vectors=star_vectors,
+            catalog_vectors=catalog_vectors,
+            initial_matches=matches,
+            side_tol_deg=0.1,
+            angle_tol_deg=2.0,
+            vote_threshold=1
+        )
+        print(f"\nRefined matches (after triad consistency): {len(refined)} kept")
+        for m in refined:
+            print(f"  Img {m['image_star_index']} → {m['catalog_star_id']} "
+                f"(pairs={m['votes']}, triads={m['triad_votes']})")
+    else:
+        print("\nToo few matches after brightness filtering; skipping triad refinement.")
 
+        print(f"\nRefined matches (after triad consistency): {len(refined)} kept")
+        for m in refined:
+            print(f"  Img {m['image_star_index']} → {m['catalog_star_id']} "
+                f"(pairs={m['votes']}, triads={m['triad_votes']})")
+
+    
+    # 4c. RANSAC attitude refinement + full‐star projection
+    if len(refined) >= 3:
+        print("\nRunning RANSAC attitude+projection to recover all stars...")
+        full_matches = ransac_refine_matches(
+            star_vectors,
+            catalog_vectors,
+            catalog_ids,
+            seed_matches=refined,
+            angle_thresh_deg=0.5
+        )
+        print(f"RANSAC recovered {len(full_matches)} stars:")
+        for m in full_matches:
+            print(f"  Img {m['image_star_index']} → {m['catalog_star_id']}")
+    else:
+        print("\nToo few refined matches for RANSAC; skipping.")
+
+    
 
     # 5. Prepare QUEST input and run attitude determination
     # Write matched star vectors and catalog IDs to a temporary file for QUEST
