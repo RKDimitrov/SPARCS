@@ -36,7 +36,7 @@ pip install -r requirements.txt
 ### **How to Run**
 1. **Navigate to the `src` directory:**
    ```bash
-   cd /media/zayko2/NewDisk/SPARCS/src
+   cd ~/SPARCS/src
    ```
 2. **Run the main pipeline:**
    ```bash
@@ -67,7 +67,7 @@ pip install -r requirements.txt
 ### **How to Run**
 1. **Navigate to the `other_approach` directory:**
    ```bash
-   cd /media/zayko2/NewDisk/SPARCS/src/other_approach
+   cd ~/SPARCS/src/other_approach
    ```
 2. **Run the main pipeline:**
    ```bash

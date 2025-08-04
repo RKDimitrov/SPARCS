@@ -13,7 +13,7 @@ from attitude_determination.compute import calculate_attitude, print_results
 IMAGE_PATH = os.path.join(os.path.dirname(__file__), '../images/MatchingImage.png')
 CATALOG_PATH = os.path.join(os.path.dirname(__file__), '../HipparcosCatalog.txt')
 OUTPUT_VECTOR_CSV = os.path.join(os.path.dirname(__file__), '../outputs/star_vectors.csv')
-FOV_DEG = 30
+FOV_DEG = 66
 QUEST_MEASUREMENTS_FILE = os.path.join(os.path.dirname(__file__), '../outputs/quest_measurements.txt')
 
 # --- PIPELINE ---
