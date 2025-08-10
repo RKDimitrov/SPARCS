@@ -3,10 +3,100 @@ import math
 import random
 import numpy as np
 import cv2
+import pandas as pd
 from scipy.spatial import cKDTree
 from scipy.optimize import linear_sum_assignment
 
-# ---------------- RA/Dec, catalog (.txt) ----------------
+# ================ QUEST IMPLEMENTATION ================
+
+def adjoint_matrix(M):
+    return np.linalg.det(M) * np.linalg.inv(M)
+
+class QUEST:
+    @staticmethod
+    def compute_B(body_vectors, inertial_vectors, weights=None):
+        n = len(body_vectors)
+        if weights is None:
+            weights = np.ones(n) / n
+        else:
+            weights = weights / np.sum(weights)
+        B = np.zeros((3, 3))
+        for b, r, w in zip(body_vectors, inertial_vectors, weights):
+            B += w * np.outer(b, r)
+        return B, weights
+
+    @staticmethod
+    def compute_S_sigma_Z(B):
+        S = B + B.T
+        sigma = np.trace(B)
+        Z = np.array([B[1, 2] - B[2, 1],
+                      B[2, 0] - B[0, 2],
+                      B[0, 1] - B[1, 0]])
+        return S, sigma, Z
+
+    @staticmethod
+    def f_and_derivative(lmbd, S, sigma, Z):
+        adjS = adjoint_matrix(S)
+        alpha = lmbd**2 - sigma**2 + np.trace(adjS)
+        M = alpha * np.eye(3) + (lmbd - sigma) * S + S @ S
+        x = M @ Z
+        A = (lmbd + sigma) * np.eye(3) - S
+        gamma = np.linalg.det(A)
+        f_val = gamma * (lmbd - sigma) - Z.T @ x
+        delta = 1e-8
+        l2 = lmbd + delta
+        alpha2 = l2**2 - sigma**2 + np.trace(adjS)
+        M2 = alpha2 * np.eye(3) + (l2 - sigma) * S + S @ S
+        x2 = M2 @ Z
+        A2 = (l2 + sigma) * np.eye(3) - S
+        gamma2 = np.linalg.det(A2)
+        f_val2 = gamma2 * (l2 - sigma) - Z.T @ x2
+        f_prime = (f_val2 - f_val) / delta
+        return f_val, f_prime, gamma, x
+
+    @staticmethod
+    def quest_method(body_vectors, inertial_vectors, weights=None, tol=1e-12, max_iter=50):
+        # Calcolo di B, S, sigma, Z
+        B, weights = QUEST.compute_B(body_vectors, inertial_vectors, weights)
+        S, sigma, Z = QUEST.compute_S_sigma_Z(B)
+
+        # λ0 fissato a 1
+        lmbd = 1.0
+
+        for iteration in range(max_iter):
+            f_val, f_prime, gamma, x = QUEST.f_and_derivative(lmbd, S, sigma, Z)
+            if abs(f_prime) < 1e-14:
+                break
+            delta = -f_val / f_prime
+            lmbd += delta
+            if abs(delta) < tol:
+                break
+
+        norm_factor = np.sqrt(gamma**2 + np.dot(x, x))
+        q = np.array([gamma, x[0], x[1], x[2]]) / norm_factor
+        if q[0] < 0:
+            q = -q
+        return q, lmbd, iteration + 1
+
+def quaternion_to_rotation_matrix(q):
+    q0, q1, q2, q3 = q
+    return np.array([
+        [1-2*(q2**2+q3**2), 2*(q1*q2-q0*q3), 2*(q1*q3+q0*q2)],
+        [2*(q1*q2+q0*q3), 1-2*(q1**2+q3**2), 2*(q2*q3-q0*q1)],
+        [2*(q1*q3-q0*q2), 2*(q2*q3+q0*q1), 1-2*(q1**2+q2**2)]
+    ])
+
+def rotation_matrix_to_euler(R):
+    pitch = np.arcsin(-R[2, 0])
+    if np.cos(pitch) > 1e-6:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        roll = 0
+        yaw = np.arctan2(-R[0, 1], R[1, 1])
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+# ================ ORIGINAL STAR IDENTIFICATION CODE ================
 
 def parse_ra_to_deg(ra_val):
     if isinstance(ra_val, (int, float)):
@@ -85,8 +175,6 @@ def parse_catalog(file_path, mag_limit=3):
     print(f"[parse_catalog] Parsed {len(stars)} stars (V ≤ {mag_limit}).")
     return stars
 
-# ---------------- star detection ----------------
-
 def detect_stars(image_path, threshold_rel=0.60, min_area=2, dedupe_px=2.0):
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None: raise FileNotFoundError(image_path)
@@ -113,8 +201,6 @@ def detect_stars(image_path, threshold_rel=0.60, min_area=2, dedupe_px=2.0):
     print(f"[detect_stars] Found {len(kept)} candidates.")
     return kept, w, h
 
-# ---------------- stereographic camera (learn f, cx, cy) ----------------
-
 def pixel_to_ray_stereo_f(x, y, cx, cy, f_pix):
     Xp = (x - cx); Yp = (cy - y)
     u = Xp/(2.0*f_pix); v = Yp/(2.0*f_pix)
@@ -132,8 +218,6 @@ def ray_to_pixel_stereo_f(v_cam, cx, cy, f_pix):
     x = cx + Xp; y = cy - Yp
     return x, y, True
 
-# ---------------- geometry ----------------
-
 def angle_between(u, v):
     return math.degrees(math.acos(max(-1.0, min(1.0, float(u @ v)))))
 
@@ -150,8 +234,6 @@ def flip_matrix(variant):
     if variant == "flip_y":  return np.diag([ 1.0,-1.0, 1.0])
     if variant == "flip_xy": return np.diag([-1.0,-1.0, 1.0])
     return np.eye(3)
-
-# ---------------- ratio descriptors (stereo-invariant) ----------------
 
 def build_catalog_descriptors(catalog, k=5, neighbor_max_deg=70.0):
     coords = np.array([s["vec"] for s in catalog], float)
@@ -197,8 +279,6 @@ def candidate_catalog_for_image(D_img, D_cat, top_m=10):
         cands.append(idx.tolist())
     return cands
 
-# ---------------- seed (learn f,cx,cy,R) via triplets ----------------
-
 def estimate_f_from_pairs(pix_pts, cat_vecs):
     pairs = [(0,1),(0,2),(1,2)]
     vals=[]
@@ -219,69 +299,69 @@ def kabsch_from_triplet(pix_pts, cat_vecs, cx, cy, f_pix, variant):
     B = np.array(cat_vecs, float)
     return kabsch_cam_to_world(A, B)
 
-def ransac_seed(stars, cand, catalog, cat_coords,
-                trials=9000, ransac_min_inliers=7,
-                ang_gate_deg=0.45, px_gate=22.0, seed=7):
-    random.seed(seed)
+def ransac_seed_fixed_f(stars, cand, catalog, cat_coords,
+                        f, cx, cy,
+                        trials=4000, min_inliers=4,
+                        ang_gate_deg=0.45, px_gate=22.0, seed=7,
+                        variants=("normal","flip_x","flip_y","flip_xy")):
+    random.seed(seed); np.random.seed(seed)
     n = len(stars)
-    brightness = np.array([s["brightness"] for s in stars], float)
-    w = brightness/brightness.sum() if brightness.sum()>0 else np.ones(n)/n
-    best={"score":-1}
+    if n < 3: return None
+    w = np.array([s["brightness"] for s in stars], float)
+    w = w/w.sum() if w.sum()>0 else np.ones(n)/n
+    thr_chord = 2.0 * math.sin(math.radians(ang_gate_deg)/2.0)
+    best = {"score":-1}
     idxs = list(range(n))
-    thr = 2.0 * math.sin(math.radians(ang_gate_deg)/2.0)
+    tree = cKDTree(cat_coords)
+
+    rays_all = np.array([pixel_to_ray_stereo_f(s["x"], s["y"], cx, cy, f) for s in stars], float)
 
     for _ in range(trials):
-        tri = list(np.random.choice(idxs, size=3, replace=False, p=w))
-        i,j,k = tri
+        i,j,k = list(np.random.choice(idxs, size=3, replace=False, p=w))
         if (np.hypot(stars[i]["x"]-stars[j]["x"], stars[i]["y"]-stars[j]["y"]) < 12 or
             np.hypot(stars[i]["x"]-stars[k]["x"], stars[i]["y"]-stars[k]["y"]) < 12 or
             np.hypot(stars[j]["x"]-stars[k]["x"], stars[j]["y"]-stars[k]["y"]) < 12):
             continue
-        try:
-            ui = random.choice(cand[i][:4]); uj = random.choice(cand[j][:4]); uk = random.choice(cand[k][:4])
-        except Exception:
-            continue
-        if len({ui,uj,uk})<3: continue
+        if not cand[i] or not cand[j] or not cand[k]: continue
 
-        pix_pts = [(stars[i]["x"], stars[i]["y"]),
-                   (stars[j]["x"], stars[j]["y"]),
-                   (stars[k]["x"], stars[k]["y"])]
-        cat_vecs = [catalog[ui]["vec"], catalog[uj]["vec"], catalog[uk]["vec"]]
-        cx = (pix_pts[0][0]+pix_pts[1][0]+pix_pts[2][0])/3.0
-        cy = (pix_pts[0][1]+pix_pts[1][1]+pix_pts[2][1])/3.0
-        f_pix = estimate_f_from_pairs(pix_pts, cat_vecs)
-        if f_pix is None or not np.isfinite(f_pix) or f_pix <= 10: continue
+        Ci = cand[i][:6]; Cj = cand[j][:6]; Ck = cand[k][:6]
+        for ui in Ci:
+            for uj in Cj:
+                if uj == ui: continue
+                for uk in Ck:
+                    if uk == ui or uk == uj: continue
 
-        for variant in ("normal","flip_x","flip_y","flip_xy"):
-            R = kabsch_from_triplet(pix_pts, cat_vecs, cx, cy, f_pix, variant)
-            if R is None or not np.isfinite(R).all(): continue
+                    A = np.vstack([rays_all[i], rays_all[j], rays_all[k]])
+                    B = np.vstack([catalog[ui]["vec"], catalog[uj]["vec"], catalog[uk]["vec"]])
 
-            # quick seed associations (angular + pixel)
-            img_rays = np.array([pixel_to_ray_stereo_f(s["x"], s["y"], cx, cy, f_pix) for s in stars], float)
-            F = flip_matrix(variant)
-            world_dirs=(R @ (F @ img_rays.T)).T
-            tree=cKDTree(cat_coords)
-            d,idx = tree.query(world_dirs, k=1)
-            order=np.argsort(d)
-            used=set(); matches=[]
-            for ii in order:
-                if d[ii] > thr: continue
-                jcat=int(idx[ii])
-                if jcat in used: continue
-                v_cam = F @ (R.T @ cat_coords[jcat])
-                xp, yp, inside = ray_to_pixel_stereo_f(v_cam, cx, cy, f_pix)
-                if not inside: continue
-                pe = math.hypot(xp - stars[ii]["x"], yp - stars[ii]["y"])
-                if pe <= px_gate:
-                    used.add(jcat)
-                    matches.append((ii, jcat))
-            sc=len(matches)
-            if sc>best["score"]:
-                best={"score":sc, "R":R, "f":f_pix, "cx":cx, "cy":cy, "variant":variant, "matches":matches}
-                if sc>=max(ransac_min_inliers, int(0.6*n)): return best
-    return best
+                    for variant in variants:
+                        F = flip_matrix(variant)
+                        R = kabsch_cam_to_world((F @ A.T).T, B)
+                        if not np.isfinite(R).all(): 
+                            continue
 
-# ---------------- refinement tools ----------------
+                        world_dirs = (R @ (F @ rays_all.T)).T
+                        d, idx = tree.query(world_dirs, k=1)
+                        order = np.argsort(d)
+                        used=set(); matches=[]
+                        for ii in order:
+                            if d[ii] > thr_chord: continue
+                            jc = int(idx[ii])
+                            if jc in used: continue
+                            v_cam = F @ (R.T @ cat_coords[jc])
+                            xp, yp, inside = ray_to_pixel_stereo_f(v_cam, cx, cy, f)
+                            if not inside: continue
+                            if math.hypot(xp - stars[ii]["x"], yp - stars[ii]["y"]) <= px_gate:
+                                used.add(jc)
+                                matches.append((ii, jc))
+
+                        sc = len(matches)
+                        if sc > best["score"]:
+                            best = {"score":sc, "R":R, "f":f, "cx":cx, "cy":cy,
+                                    "variant":variant, "matches":matches}
+                            if sc >= max(min_inliers, int(0.6*n)):
+                                return best
+    return best if best["score"] > 0 else None
 
 def refine_R(R_cw, f_pix, cx, cy, variant, stars, matches, cat_coords):
     if len(matches) < 3: return R_cw
@@ -294,26 +374,6 @@ def refine_R(R_cw, f_pix, cx, cy, variant, stars, matches, cat_coords):
     A=np.array(A,float); B=np.array(B,float)
     return kabsch_cam_to_world(A, B)
 
-def refine_intrinsics_grid(R_cw, f_pix, cx, cy, variant, stars, matches, cat_coords):
-    if len(matches) < 3: return f_pix, cx, cy
-    F = flip_matrix(variant)
-    def sse(f2, cx2, cy2):
-        s=0.0
-        for i,j in matches:
-            v_cam = F @ (R_cw.T @ cat_coords[j])
-            xp,yp,_ = ray_to_pixel_stereo_f(v_cam, cx2, cy2, f2)
-            dx = xp - stars[i]["x"]; dy = yp - stars[i]["y"]
-            s += dx*dx + dy*dy
-        return s
-    best=(1e18,f_pix,cx,cy)
-    for sf in (0.985,1.0,1.015):
-        for dx in (-6.0,0.0,6.0):
-            for dy in (-6.0,0.0,6.0):
-                f2, cx2, cy2 = f_pix*sf, cx+dx, cy+dy
-                val = sse(f2, cx2, cy2)
-                if val < best[0]: best=(val,f2,cx2,cy2)
-    return best[1], best[2], best[3]
-
 def project_catalog_pixels(R_cw, f_pix, cx, cy, variant, catalog, img_w, img_h):
     F = flip_matrix(variant)
     pts=[]
@@ -323,7 +383,7 @@ def project_catalog_pixels(R_cw, f_pix, cx, cy, variant, catalog, img_w, img_h):
         if not inside: continue
         if x<0 or x>=img_w or y<0 or y>=img_h: continue
         pts.append((j,x,y))
-    return pts  # (cat_idx, x, y)
+    return pts
 
 def brightness_ranks(stars):
     order = np.argsort([-s["brightness"] for s in stars])
@@ -332,16 +392,13 @@ def brightness_ranks(stars):
 
 def mag_ranks(catalog, cat_idxs):
     mags = np.array([catalog[j]["vmag"] for j in cat_idxs], float)
-    order = np.argsort(mags)  # smaller mag = brighter
+    order = np.argsort(mags)
     rank = np.empty(len(cat_idxs), int); rank[order] = np.arange(len(cat_idxs))
     return rank
-
-# ---------------- pairwise-consistency prune ----------------
 
 def pairwise_prune(matches, stars, catalog, R_cw, f_pix, cx, cy, variant, tol_deg=0.25, min_support=2):
     if len(matches) <= 2: return matches
     F = flip_matrix(variant)
-    # Build camera-frame rays for all detections
     rays = [pixel_to_ray_stereo_f(stars[i]["x"], stars[i]["y"], cx, cy, f_pix) for i,_ in matches]
     raysF = [(F @ r) for r in rays]
     cats  = [catalog[j]["vec"] for _,j in matches]
@@ -359,24 +416,18 @@ def pairwise_prune(matches, stars, catalog, R_cw, f_pix, cx, cy, variant, tol_de
             keep.append((i_a, j_a))
     return keep
 
-# ---------------- descriptor-constrained Hungarian assignment ----------------
-
 def hungarian_assign_desc(R_cw, f_pix, cx, cy, variant,
                           stars, catalog, img_w, img_h,
                           cand_lists, px_gate=22.0, ang_gate_deg=0.45,
                           w_pos=1.0, w_brightness=0.12):
-    # project catalog to pixels
     proj = project_catalog_pixels(R_cw, f_pix, cx, cy, variant, catalog, img_w, img_h)
     if not proj: return []
     cat_idx = [t[0] for t in proj]
     cat_xy  = np.array([[t[1],t[2]] for t in proj], float)
-    # KD-tree in pixel space
     tree = cKDTree(cat_xy)
-    # per-detector pixel coord
     det_xy = np.array([[s["x"], s["y"]] for s in stars], float)
     det_rank = brightness_ranks(stars)
     cat_rank = mag_ranks(catalog, cat_idx)
-    # angular gate (per detection)
     F = flip_matrix(variant)
     thr_chord = 2.0 * math.sin(math.radians(ang_gate_deg)/2.0)
 
@@ -385,27 +436,23 @@ def hungarian_assign_desc(R_cw, f_pix, cx, cy, variant,
     cost = np.full((N,M), BIG, float)
 
     for i,(x,y) in enumerate(det_xy):
-        # candidate set = (pixel gate) ∩ (descriptor top list mapped into projected set)
         near = tree.query_ball_point([x,y], r=px_gate)
         if not near: continue
-        cand_global = set(cand_lists[i])              # global catalog indices by descriptor
+        cand_global = set(cand_lists[i])
         cand_local  = [k for k in near if cat_idx[k] in cand_global]
         if not cand_local:
             continue
-        # angular gate around predicted world ray (extra safety)
         v_meas = F @ pixel_to_ray_stereo_f(x, y, cx, cy, f_pix)
         ray_world = R_cw @ v_meas
-        # precompute angular separations
-        # build a small list that passes the angular gate too
         ok_local=[]
         for k in cand_local:
             dot = float(ray_world @ catalog[cat_idx[k]]["vec"])
             if 1.0 - dot*dot < 0: dot = max(-1.0, min(1.0, dot))
             ang = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
-            if ang <= ang_gate_deg*1.2:  # a tad looser than global ang gate
+            if ang <= ang_gate_deg*1.2:
                 ok_local.append(k)
         if not ok_local: 
-            ok_local = cand_local  # fallback to pixel-only if too strict
+            ok_local = cand_local
 
         for k in ok_local:
             dx = x - cat_xy[k,0]; dy = y - cat_xy[k,1]
@@ -417,30 +464,11 @@ def hungarian_assign_desc(R_cw, f_pix, cx, cy, variant,
     row_ind, col_ind = linear_sum_assignment(cost)
     matches=[]
     for i,jc in zip(row_ind, col_ind):
-        if cost[i,jc] >= BIG*0.5:  # infeasible
+        if cost[i,jc] >= BIG*0.5:
             continue
-        # final tight pixel gate again
         if math.hypot(det_xy[i,0]-cat_xy[jc,0], det_xy[i,1]-cat_xy[jc,1]) <= px_gate:
             matches.append((i, cat_idx[jc]))
     return matches
-
-# ---------------- annotate & debug ----------------
-
-def debug_dump(params, stars, catalog):
-    R = params["R"]; f_pix=params["f"]; cx=params["cx"]; cy=params["cy"]; variant=params["variant"]
-    print(f"[debug] image params: f={f_pix:.1f}px, cx={cx:.1f}, cy={cy:.1f}, variant={variant}")
-    print("[debug] sample matches:")
-    F = flip_matrix(variant)
-    for (ii, jj) in params["matches"][:12]:
-        xd, yd = stars[ii]["x"], stars[ii]["y"]
-        v_cam = F @ (R.T @ catalog[jj]["vec"])
-        xp, yp, inside = ray_to_pixel_stereo_f(v_cam, cx, cy, f_pix)
-        pe = math.hypot((xp or 0)-xd, (yp or 0)-yd) if inside else float("inf")
-        v_meas = F @ pixel_to_ray_stereo_f(xd, yd, cx, cy, f_pix)
-        ray_world = R @ v_meas
-        dotc = max(-1.0, min(1.0, float(ray_world @ catalog[jj]["vec"])))
-        ang_err = math.degrees(math.acos(dotc))*60.0
-        print(f"  det=({xd:.1f},{yd:.1f}) -> {catalog[jj]['id']}  px_err={pe:.1f}  ang_err={ang_err:.1f}'")
 
 def annotate(image_path, stars, matches, catalog, out_path="annotated.png"):
     img=cv2.imread(image_path)
@@ -452,338 +480,552 @@ def annotate(image_path, stars, matches, catalog, out_path="annotated.png"):
     cv2.imwrite(out_path,img)
     print(f"[annotate] Saved {out_path}")
 
-# # ---------------- main ----------------
-
-# def main(catalog_path,
-#          image_path,
-#          mag_limit=3,
-#          max_image_stars=26,
-#          k_desc=5,
-#          top_m=10,
-#          # gates
-#          ang_gate_deg=0.45,
-#          px_gate_seed=22.0,
-#          px_gate_assign_1=24.0,   # pass-1 (loose)
-#          px_gate_assign_2=16.0,   # pass-2 (tighten)
-#          # RANSAC
-#          ransac_trials=9000,
-#          ransac_min_inliers=7,
-#          refine_loops=2,
-#          seed=7):
-
-#     random.seed(seed); np.random.seed(seed)
-
-#     # detections
-#     stars_all, img_w, img_h = detect_stars(image_path, threshold_rel=0.62, min_area=2, dedupe_px=2.0)
-#     stars = stars_all[:max_image_stars]
-#     print(f"[debug] image size = {img_w} x {img_h}px; using {len(stars)} detections")
-
-#     # catalog + descriptors
-#     catalog = parse_catalog(catalog_path, mag_limit=mag_limit)
-#     D_img, _, _ = build_image_descriptors(stars, k=k_desc)
-#     D_cat, _, cat_coords = build_catalog_descriptors(catalog, k=k_desc, neighbor_max_deg=70.0)
-#     cand = candidate_catalog_for_image(D_img, D_cat, top_m=top_m)   # list per detection (global indices)
-
-#     # seed pose
-#     best = ransac_seed(stars, cand, catalog, cat_coords,
-#                        trials=ransac_trials, ransac_min_inliers=ransac_min_inliers,
-#                        ang_gate_deg=ang_gate_deg, px_gate=px_gate_seed, seed=seed)
-#     if best.get("score",-1) < 3:
-#         print("[final] No seed pose. Try: px_gate_seed=28, max_image_stars=22, threshold_rel=0.66.")
-#         return
-
-#     # -------- PASS 1: descriptor-constrained Hungarian, pairwise-prune, refine --------
-#     matches = hungarian_assign_desc(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                                     stars, catalog, img_w, img_h,
-#                                     cand, px_gate=px_gate_assign_1, ang_gate_deg=ang_gate_deg,
-#                                     w_pos=1.0, w_brightness=0.12)
-#     matches = pairwise_prune(matches, stars, catalog, best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                              tol_deg=0.25, min_support=2)
-
-#     for _ in range(refine_loops):
-#         best["R"] = refine_R(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                              stars, matches, cat_coords)
-#         best["f"], best["cx"], best["cy"] = refine_intrinsics_grid(best["R"], best["f"], best["cx"], best["cy"],
-#                                                                    best["variant"], stars, matches, cat_coords)
-#         matches = hungarian_assign_desc(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                                         stars, catalog, img_w, img_h,
-#                                         cand, px_gate=px_gate_assign_1, ang_gate_deg=ang_gate_deg,
-#                                         w_pos=1.0, w_brightness=0.12)
-#         matches = pairwise_prune(matches, stars, catalog, best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                                  tol_deg=0.25, min_support=2)
-
-#     # -------- PASS 2: tighten gates and finalize --------
-#     matches = hungarian_assign_desc(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                                     stars, catalog, img_w, img_h,
-#                                     cand, px_gate=px_gate_assign_2, ang_gate_deg=0.35,
-#                                     w_pos=1.0, w_brightness=0.16)
-#     matches = pairwise_prune(matches, stars, catalog, best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-#                              tol_deg=0.22, min_support=2)
-#     best["matches"] = matches
-
-#     # attitude
-#     b_world = best["R"] @ np.array([0,0,1.0]); b_world/= (np.linalg.norm(b_world)+1e-12)
-#     bx,by,bz = b_world
-#     dec = math.degrees(math.asin(bz))
-#     ra  = (math.degrees(math.atan2(by,bx)) % 360.0)
-#     print(f"[best] inliers={len(best['matches'])}/{len(stars)}  (stereo; learned f & center; desc+Hungarian+pairwise)")
-#     print(f"[attitude] Boresight ≈ RA {ra:.2f}°, Dec {dec:.2f}°")
-#     debug_dump(best, stars, catalog)
-#     annotate(image_path, stars, best["matches"], catalog, out_path="annotated.png")
-
-# # -------- entry --------
-# if __name__ == "__main__":
-#     catalog_txt = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\hipparcos_N3.txt"
-#     image_png   = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\pov.png"
-#     main(
-#         catalog_path=catalog_txt,
-#         image_path=image_png,
-#         mag_limit=3,
-#         max_image_stars=26,      # you can try 28–30 once IDs look clean
-#         k_desc=5,
-#         top_m=10,
-#         ang_gate_deg=0.45,
-#         px_gate_seed=22.0,
-#         px_gate_assign_1=24.0,   # pass-1
-#         px_gate_assign_2=16.0,   # pass-2 (tight)
-#         ransac_trials=9000,
-#         ransac_min_inliers=7,
-#         refine_loops=2,
-#         seed=7
-#     )
-
-
-
-
-# ============================ Fixed-FOV attitude (center = boresight) ============================
-
 def intrinsics_from_fov(img_w, img_h, fov_deg, vertical=True):
-    """
-    Stereographic: r = 2 f tan(theta/2). At the top/bottom (or left/right) edge,
-    r_pix = (H/2) or (W/2) and theta = FOV/2.
-    => f = r_pix / (2 * tan((FOV/2)/2)) = r_pix / (2 * tan(FOV/4)).
-    """
     r_pix = (img_h/2.0) if vertical else (img_w/2.0)
     f = r_pix / (2.0 * math.tan(math.radians(fov_deg/4.0)))
     cx, cy = img_w/2.0, img_h/2.0
     return f, cx, cy
-
-def ransac_seed_fixed_f(stars, cand, catalog, cat_coords,
-                        f, cx, cy,
-                        trials=4000, min_inliers=4,
-                        ang_gate_deg=0.45, px_gate=22.0, seed=7,
-                        variants=("normal","flip_x","flip_y","flip_xy")):
-    """
-    RANSAC that estimates ONLY rotation (R). f,cx,cy are fixed to the image center & given FOV.
-    """
-    random.seed(seed); np.random.seed(seed)
-    n = len(stars)
-    if n < 3: return None
-    w = np.array([s["brightness"] for s in stars], float)
-    w = w/w.sum() if w.sum()>0 else np.ones(n)/n
-    thr_chord = 2.0 * math.sin(math.radians(ang_gate_deg)/2.0)
-    best = {"score":-1}
-    idxs = list(range(n))
-    tree = cKDTree(cat_coords)
-
-    # Precompute rays once for speed
-    rays_all = np.array([pixel_to_ray_stereo_f(s["x"], s["y"], cx, cy, f) for s in stars], float)
-
-    for _ in range(trials):
-        i,j,k = list(np.random.choice(idxs, size=3, replace=False, p=w))
-        # avoid tiny triangles in pixels
-        if (np.hypot(stars[i]["x"]-stars[j]["x"], stars[i]["y"]-stars[j]["y"]) < 12 or
-            np.hypot(stars[i]["x"]-stars[k]["x"], stars[i]["y"]-stars[k]["y"]) < 12 or
-            np.hypot(stars[j]["x"]-stars[k]["x"], stars[j]["y"]-stars[k]["y"]) < 12):
-            continue
-        if not cand[i] or not cand[j] or not cand[k]: continue
-
-        # try a few top descriptor candidates
-        Ci = cand[i][:6]; Cj = cand[j][:6]; Ck = cand[k][:6]
-        for ui in Ci:
-            for uj in Cj:
-                if uj == ui: continue
-                for uk in Ck:
-                    if uk == ui or uk == uj: continue
-
-                    A = np.vstack([rays_all[i], rays_all[j], rays_all[k]])
-                    B = np.vstack([catalog[ui]["vec"], catalog[uj]["vec"], catalog[uk]["vec"]])
-
-                    for variant in variants:
-                        F = flip_matrix(variant)
-                        R = kabsch_cam_to_world((F @ A.T).T, B)
-                        if not np.isfinite(R).all(): 
-                            continue
-
-                        # quick associate all detections with fixed f,cx,cy
-                        world_dirs = (R @ (F @ rays_all.T)).T
-                        d, idx = tree.query(world_dirs, k=1)
-                        order = np.argsort(d)
-                        used=set(); matches=[]
-                        for ii in order:
-                            if d[ii] > thr_chord: continue
-                            jc = int(idx[ii])
-                            if jc in used: continue
-                            # pixel reprojection check
-                            v_cam = F @ (R.T @ cat_coords[jc])
-                            xp, yp, inside = ray_to_pixel_stereo_f(v_cam, cx, cy, f)
-                            if not inside: continue
-                            if math.hypot(xp - stars[ii]["x"], yp - stars[ii]["y"]) <= px_gate:
-                                used.add(jc)
-                                matches.append((ii, jc))
-
-                        sc = len(matches)
-                        if sc > best["score"]:
-                            best = {"score":sc, "R":R, "f":f, "cx":cx, "cy":cy,
-                                    "variant":variant, "matches":matches}
-                            if sc >= max(min_inliers, int(0.6*n)):
-                                return best
-    return best if best["score"] > 0 else None
-
-def solve_one_image_fixed_fov(catalog_path, image_path, fov_deg,
-                              fov_is_vertical=True,
-                              # detection / pipeline knobs kept minimal & fast
-                              mag_limit=3, max_image_stars=26,
-                              k_desc=5, top_m=10,
-                              ang_gate_deg=0.45,
-                              px_gate_seed=22.0,
-                              px_gate_assign=20.0,
-                              refine_loops=1,
-                              seed=7,
-                              annotate_suffix="_fixedFOV.png"):
-    """
-    Full solve for a single image with (f, cx, cy) locked to image center and given FOV.
-    Returns dict with R, boresight, RA/Dec and matches.
-    """
-    random.seed(seed); np.random.seed(seed)
-
-    # detect
-    stars_all, W, H = detect_stars(image_path, threshold_rel=0.60, min_area=2, dedupe_px=2.0)
-    stars = stars_all[:max_image_stars]
-    if len(stars) < 6:
-        print(f"[fixedFOV] Too few detections in {image_path}."); 
-        return None
-
-    # fixed intrinsics from FOV and center
-    f, cx, cy = intrinsics_from_fov(W, H, fov_deg, vertical=fov_is_vertical)
-
-    # bright catalog + descriptors
-    catalog = parse_catalog(catalog_path, mag_limit=mag_limit)
-    D_img, _, _   = build_image_descriptors(stars, k=k_desc)
-    D_cat, _, ccoords = build_catalog_descriptors(catalog, k=k_desc, neighbor_max_deg=70.0)
-    cand = candidate_catalog_for_image(D_img, D_cat, top_m=top_m)
-
-    # seed R only
-    best = ransac_seed_fixed_f(stars, cand, catalog, ccoords,
-                               f, cx, cy,
-                               trials=4000, min_inliers=4,
-                               ang_gate_deg=ang_gate_deg, px_gate=px_gate_seed, seed=seed)
-    if not best or best["score"] < 3:
-        print(f"[fixedFOV] No seed pose for {image_path}.")
-        return None
-
-    # small assignment (descriptor-constrained, single pass) + prune + refine R only
-    matches = hungarian_assign_desc(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-                                    stars, catalog, W, H,
-                                    cand, px_gate=px_gate_assign, ang_gate_deg=ang_gate_deg,
-                                    w_pos=1.0, w_brightness=0.12)
-    matches = pairwise_prune(matches, stars, catalog, best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-                             tol_deg=0.25, min_support=2)
-
-    for _ in range(refine_loops):
-        best["R"] = refine_R(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-                             stars, matches, ccoords)
-        matches = hungarian_assign_desc(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-                                        stars, catalog, W, H,
-                                        cand, px_gate=px_gate_assign, ang_gate_deg=ang_gate_deg,
-                                        w_pos=1.0, w_brightness=0.12)
-        matches = pairwise_prune(matches, stars, catalog, best["R"], best["f"], best["cx"], best["cy"], best["variant"],
-                                 tol_deg=0.23, min_support=2)
-
-    # boresight of image CENTER
-    b_world = best["R"] @ np.array([0,0,1.0])
-    b_world /= (np.linalg.norm(b_world) + 1e-12)
-    bx,by,bz = b_world
-    dec = math.degrees(math.asin(bz))
-    ra  = (math.degrees(math.atan2(by,bx)) % 360.0)
-
-    print(f"[fixedFOV] {image_path}: matches={len(matches)}/{len(stars)}  RA={ra:.3f}°, Dec={dec:.3f}°  (boresight=center)")
-    # annotate
-    import os
-    base = os.path.splitext(os.path.basename(image_path))[0]
-    annotate(image_path, stars, matches, catalog, out_path=f"{base}{annotate_suffix}")
-
-    return {"R":best["R"], "boresight":b_world, "ra_deg":ra, "dec_deg":dec,
-            "matches":matches, "stars":stars, "f":f, "cx":cx, "cy":cy, "variant":best["variant"]}
 
 def angle_between_vecs_deg(u, v):
     un = np.asarray(u, float); vn = np.asarray(v, float)
     un /= (np.linalg.norm(un)+1e-12); vn /= (np.linalg.norm(vn)+1e-12)
     return math.degrees(math.acos(float(np.clip(un@vn, -1.0, 1.0))))
 
-def solve_two_images_fixed_fov(catalog_path, image1_path, image2_path,
-                               fov_deg=66.0, fov_is_vertical=True, **kwargs):
-    r1 = solve_one_image_fixed_fov(catalog_path, image1_path, fov_deg, fov_is_vertical, **kwargs)
-    r2 = solve_one_image_fixed_fov(catalog_path, image2_path, fov_deg, fov_is_vertical, **kwargs)
-    if r1 is None or r2 is None:
-        print("[fixedFOV] Could not get both attitudes."); 
-        return r1, r2, None
-    sep = angle_between_vecs_deg(r1["boresight"], r2["boresight"])
-    print(f"[fixedFOV] Boresight separation (center-to-center) = {sep:.4f}°")
-    return r1, r2, sep
+def quaternion_angular_distance(q1, q2):
+    """
+    Calculate angular distance between two quaternions in degrees
+    Formula: angle = 2 * arccos(|q1 · q2|)
+    """
+    # Ensure quaternions are normalized
+    q1 = q1 / np.linalg.norm(q1)
+    q2 = q2 / np.linalg.norm(q2)
+    
+    # Calculate dot product
+    dot_product = abs(np.dot(q1, q2))
+    
+    # Clamp to avoid numerical errors
+    dot_product = np.clip(dot_product, 0.0, 1.0)
+    
+    # Calculate angular distance
+    angle_rad = 2 * np.arccos(dot_product)
+    angle_deg = np.degrees(angle_rad)
+    
+    return angle_deg
 
+def create_3d_reference_frame_plot(result, image_name, output_path):
+    """
+    Create 3D plot showing camera reference frame relative to inertial frame
+    """
+    try:
+        import plotly.graph_objects as go
+        import plotly.offline as pyo
+    except ImportError:
+        print(f"[Warning] Plotly not available. Skipping 3D plot generation.")
+        print(f"[Info] Install with: pip install plotly")
+        return
+    
+    # Rotation matrix from QUEST
+    R = result["rotation_matrix"]
+    
+    # Inertial frame (world) - standard XYZ
+    inertial_x = np.array([1, 0, 0])
+    inertial_y = np.array([0, 1, 0]) 
+    inertial_z = np.array([0, 0, 1])
+    
+    # Camera frame rotated by R
+    camera_x = R @ inertial_x
+    camera_y = R @ inertial_y
+    camera_z = R @ inertial_z
+    
+    fig = go.Figure()
+    
+    # Earth sphere at center (small blue sphere)
+    fig.add_trace(go.Scatter3d(
+        x=[0], y=[0], z=[0],
+        mode='markers',
+        marker=dict(size=12, color='lightblue', opacity=0.8),
+        name='Earth',
+        showlegend=True
+    ))
+    
+    # Inertial frame (black, thin, clean)
+    fig.add_trace(go.Scatter3d(
+        x=[0, inertial_x[0]], y=[0, inertial_x[1]], z=[0, inertial_x[2]],
+        mode='lines+text',
+        line=dict(color='black', width=3),
+        text=['', 'X'],
+        textposition='middle center',
+        textfont=dict(size=14, color='black'),
+        name='Inertial X',
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter3d(
+        x=[0, inertial_y[0]], y=[0, inertial_y[1]], z=[0, inertial_y[2]],
+        mode='lines+text',
+        line=dict(color='black', width=3),
+        text=['', 'Y'],
+        textposition='middle center',
+        textfont=dict(size=14, color='black'),
+        name='Inertial Y',
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter3d(
+        x=[0, inertial_z[0]], y=[0, inertial_z[1]], z=[0, inertial_z[2]],
+        mode='lines+text',
+        line=dict(color='black', width=3),
+        text=['', 'Z'],
+        textposition='middle center',
+        textfont=dict(size=14, color='black'),
+        name='Inertial Z',
+        showlegend=True
+    ))
+    
+    # Camera frame (colored, dashed, slightly thinner)
+    fig.add_trace(go.Scatter3d(
+        x=[0, camera_x[0]], y=[0, camera_x[1]], z=[0, camera_x[2]],
+        mode='lines+text',
+        line=dict(color='red', width=4, dash='dash'),
+        text=['', 'Xc'],
+        textposition='middle center',
+        textfont=dict(size=12, color='red'),
+        name='Camera X',
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter3d(
+        x=[0, camera_y[0]], y=[0, camera_y[1]], z=[0, camera_y[2]],
+        mode='lines+text',
+        line=dict(color='green', width=4, dash='dash'),
+        text=['', 'Yc'],
+        textposition='middle center',
+        textfont=dict(size=12, color='green'),
+        name='Camera Y',
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter3d(
+        x=[0, camera_z[0]], y=[0, camera_z[1]], z=[0, camera_z[2]],
+        mode='lines+text',
+        line=dict(color='blue', width=4, dash='dash'),
+        text=['', 'Zc'],
+        textposition='middle center',
+        textfont=dict(size=12, color='blue'),
+        name='Camera Z',
+        showlegend=True
+    ))
+    
+    # Boresight direction vector (prominent but not too thick)
+    boresight = result["boresight"]
+    fig.add_trace(go.Scatter3d(
+        x=[0, boresight[0]], y=[0, boresight[1]], z=[0, boresight[2]],
+        mode='lines+markers+text',
+        line=dict(color='purple', width=6),
+        marker=dict(size=8, color='purple'),
+        text=['', 'Boresight'],
+        textposition='middle center',
+        textfont=dict(size=14, color='purple'),
+        name='Boresight Vector',
+        showlegend=True
+    ))
+    
+    fig.update_layout(
+        title=dict(
+            text=f'3D Reference Frames - {image_name}<br>'
+                 f'RA: {result["ra_deg"]:.3f}°, Dec: {result["dec_deg"]:.3f}°<br>'
+                 f'Matches: {len(result["matches"])}, Error: {result["mean_error"]:.3f}°',
+            x=0.5,
+            font=dict(size=16)
+        ),
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y', 
+            zaxis_title='Z',
+            aspectmode='cube',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.5)),
+            xaxis=dict(showgrid=True, gridcolor='lightgray', gridwidth=1),
+            yaxis=dict(showgrid=True, gridcolor='lightgray', gridwidth=1),
+            zaxis=dict(showgrid=True, gridcolor='lightgray', gridwidth=1),
+            bgcolor='white'
+        ),
+        width=900,
+        height=700,
+        font=dict(size=12),
+        legend=dict(
+            x=0.02,
+            y=0.98,
+            bgcolor='rgba(255,255,255,0.8)',
+            bordercolor='black',
+            borderwidth=1
+        )
+    )
+    
+    pyo.plot(fig, filename=output_path, auto_open=False)
+    print(f"[3D Plot] Saved {output_path}")
 
-# ============================ SINGLE-IMAGE CONVENIENCE CALL ============================
+def save_results_to_file(result1, result2, angular_distance, output_path):
+    """
+    Save detailed results to text file
+    """
+    import os
+    from datetime import datetime
+    
+    with open(output_path, 'w', encoding='utf-8') as f:  # Fixed encoding
+        f.write("="*80 + "\n")
+        f.write("DUAL IMAGE ATTITUDE DETERMINATION RESULTS\n")
+        f.write("="*80 + "\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Method: QUEST Algorithm\n\n")
+        
+        # Image 1 results
+        f.write("IMAGE 1 RESULTS:\n")
+        f.write("-"*40 + "\n")
+        f.write(f"RA:  {result1['ra_deg']:.8f}°\n")
+        f.write(f"Dec: {result1['dec_deg']:.8f}°\n")
+        f.write(f"Quaternion (w,x,y,z): [{result1['quaternion'][0]:.8f}, {result1['quaternion'][1]:.8f}, {result1['quaternion'][2]:.8f}, {result1['quaternion'][3]:.8f}]\n")
+        f.write(f"Euler Angles (roll,pitch,yaw): [{result1['euler_angles'][0]:.6f}°, {result1['euler_angles'][1]:.6f}°, {result1['euler_angles'][2]:.6f}°]\n")
+        f.write(f"Matched stars: {len(result1['matches'])}\n")
+        f.write(f"Star IDs: {', '.join(result1['matched_star_ids'])}\n")
+        f.write(f"QUEST lambda_max: {result1['lambda_max']:.10f}\n")  # Fixed lambda character
+        f.write(f"QUEST iterations: {result1['quest_iterations']}\n")
+        f.write(f"Mean angular error: {result1['mean_error']:.6f}°\n")
+        f.write(f"Max angular error: {result1['max_error']:.6f}°\n")
+        f.write(f"RMS angular error: {result1['rms_error']:.6f}°\n")
+        f.write(f"Min angular error: {result1['min_error']:.6f}°\n")
+        
+        f.write("\nRotation Matrix:\n")
+        R1 = result1['rotation_matrix']
+        for i in range(3):
+            f.write(f"[{R1[i,0]:10.7f} {R1[i,1]:10.7f} {R1[i,2]:10.7f}]\n")
+        
+        f.write(f"\nBoresight vector: [{result1['boresight'][0]:.8f}, {result1['boresight'][1]:.8f}, {result1['boresight'][2]:.8f}]\n")
+        
+        f.write("\nIndividual star errors:\n")
+        for star_id, error in zip(result1['matched_star_ids'], result1['angular_errors']):
+            f.write(f"  {star_id:>8}: {error:7.4f}°\n")
+        
+        # Image 2 results
+        f.write("\n\nIMAGE 2 RESULTS:\n")
+        f.write("-"*40 + "\n")
+        f.write(f"RA:  {result2['ra_deg']:.8f}°\n")
+        f.write(f"Dec: {result2['dec_deg']:.8f}°\n")
+        f.write(f"Quaternion (w,x,y,z): [{result2['quaternion'][0]:.8f}, {result2['quaternion'][1]:.8f}, {result2['quaternion'][2]:.8f}, {result2['quaternion'][3]:.8f}]\n")
+        f.write(f"Euler Angles (roll,pitch,yaw): [{result2['euler_angles'][0]:.6f}°, {result2['euler_angles'][1]:.6f}°, {result2['euler_angles'][2]:.6f}°]\n")
+        f.write(f"Matched stars: {len(result2['matches'])}\n")
+        f.write(f"Star IDs: {', '.join(result2['matched_star_ids'])}\n")
+        f.write(f"QUEST lambda_max: {result2['lambda_max']:.10f}\n")  # Fixed lambda character
+        f.write(f"QUEST iterations: {result2['quest_iterations']}\n")
+        f.write(f"Mean angular error: {result2['mean_error']:.6f}°\n")
+        f.write(f"Max angular error: {result2['max_error']:.6f}°\n")
+        f.write(f"RMS angular error: {result2['rms_error']:.6f}°\n")
+        f.write(f"Min angular error: {result2['min_error']:.6f}°\n")
+        
+        f.write("\nRotation Matrix:\n")
+        R2 = result2['rotation_matrix']
+        for i in range(3):
+            f.write(f"[{R2[i,0]:10.7f} {R2[i,1]:10.7f} {R2[i,2]:10.7f}]\n")
+        
+        f.write(f"\nBoresight vector: [{result2['boresight'][0]:.8f}, {result2['boresight'][1]:.8f}, {result2['boresight'][2]:.8f}]\n")
+        
+        f.write("\nIndividual star errors:\n")
+        for star_id, error in zip(result2['matched_star_ids'], result2['angular_errors']):
+            f.write(f"  {star_id:>8}: {error:7.4f}°\n")
+        
+        # Comparison results
+        f.write("\n\nCOMPARISON ANALYSIS:\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Quaternion angular distance: {angular_distance:.8f}°\n")
+        
+        ra_diff = abs(result1['ra_deg'] - result2['ra_deg'])
+        if ra_diff > 180:
+            ra_diff = 360 - ra_diff
+        dec_diff = abs(result1['dec_deg'] - result2['dec_deg'])
+        f.write(f"RA difference: {ra_diff:.8f}°\n")
+        f.write(f"Dec difference: {dec_diff:.8f}°\n")
+        
+        # Camera parameters
+        f.write("\n\nCAMERA PARAMETERS:\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Focal length: {result1['f']:.2f} pixels\n")
+        f.write(f"Principal point: ({result1['cx']:.1f}, {result1['cy']:.1f})\n")
+        f.write(f"Image variant: {result1['variant']}\n")
+    
+    print(f"[Results File] Saved {output_path}")
 
-def solve_single_image_fixed_fov(catalog_path,
+def solve_two_images_with_quest(catalog_path,
+                               image1_path,
+                               image2_path,
+                               **kwargs):
+    """
+    Solve attitude for two images and calculate angular distance between them
+    """
+    print(f"\n{'='*100}")
+    print(f"DUAL IMAGE ATTITUDE DETERMINATION WITH QUEST")
+    print(f"{'='*100}")
+    
+    # Solve first image
+    print(f"\n🌟 PROCESSING FIRST IMAGE: {image1_path}")
+    result1 = solve_single_image_with_quest(catalog_path, image1_path, **kwargs)
+    
+    if result1 is None:
+        print(f"❌ Failed to solve first image")
+        return None, None, None
+    
+    # Solve second image  
+    print(f"\n🌟 PROCESSING SECOND IMAGE: {image2_path}")
+    result2 = solve_single_image_with_quest(catalog_path, image2_path, **kwargs)
+    
+    if result2 is None:
+        print(f"❌ Failed to solve second image")
+        return result1, None, None
+    
+    # Calculate angular distance between quaternions
+    q1 = result1["quaternion"]
+    q2 = result2["quaternion"]
+    angular_distance = quaternion_angular_distance(q1, q2)
+    
+    # Summary output (simplified)
+    print(f"\n{'='*100}")
+    print(f"DUAL IMAGE COMPARISON RESULTS")
+    print(f"{'='*100}")
+    
+    print(f"\nIMAGE 1 ({image1_path}):")
+    print(f"  RA:  {result1['ra_deg']:.6f}°")
+    print(f"  Dec: {result1['dec_deg']:.6f}°")
+    print(f"  Quaternion: [{result1['quaternion'][0]:.6f}, {result1['quaternion'][1]:.6f}, {result1['quaternion'][2]:.6f}, {result1['quaternion'][3]:.6f}]")
+    print(f"  Matched stars: {len(result1['matches'])}")
+    print(f"  Mean error: {result1['mean_error']:.4f}°")
+    
+    print(f"\nIMAGE 2 ({image2_path}):")
+    print(f"  RA:  {result2['ra_deg']:.6f}°")
+    print(f"  Dec: {result2['dec_deg']:.6f}°")
+    print(f"  Quaternion: [{result2['quaternion'][0]:.6f}, {result2['quaternion'][1]:.6f}, {result2['quaternion'][2]:.6f}, {result2['quaternion'][3]:.6f}]")
+    print(f"  Matched stars: {len(result2['matches'])}")
+    print(f"  Mean error: {result2['mean_error']:.4f}°")
+    
+    print(f"\nANGULAR DISTANCE:")
+    print(f"  Quaternion angular distance: {angular_distance:.6f}°")
+    
+    # Generate outputs
+    import os
+    base_dir = os.path.dirname(image1_path) if os.path.dirname(image1_path) else "."
+    
+    # Save detailed results to file
+    results_file = os.path.join(base_dir, "attitude_results.txt")
+    save_results_to_file(result1, result2, angular_distance, results_file)
+    
+    # Create 3D plots (requires plotly)
+    plot1_path = os.path.join(base_dir, "reference_frame_image1.html")
+    plot2_path = os.path.join(base_dir, "reference_frame_image2.html")
+    
+    print(f"\n[Generating 3D plots...]")
+    create_3d_reference_frame_plot(result1, "Image 1", plot1_path)
+    create_3d_reference_frame_plot(result2, "Image 2", plot2_path)
+    
+    return result1, result2, angular_distance
+
+def solve_single_image_with_quest(catalog_path,
                                  image_path,
                                  *,
-                                 fov_deg=66.0,           # set your known vertical (or horizontal) FoV
-                                 fov_is_vertical=True,   # True if fov_deg is vertical FoV; False if it's horizontal
-                                 mag_limit=3,            # bright seed catalog limit (same as before)
+                                 fov_deg=66.0,
+                                 fov_is_vertical=True,
+                                 mag_limit=3,
                                  max_image_stars=26,
                                  k_desc=5,
                                  top_m=10,
                                  ang_gate_deg=0.45,
                                  px_gate_seed=22.0,
                                  px_gate_assign=20.0,
-                                 refine_loops=1,
+                                 refine_loops=1,  # mantenuto per compatibilità (non usato)
                                  seed=7,
-                                 annotate_suffix="_fixedFOV.png"):
+                                 annotate_suffix="_quest.png"):
     """
-    Runs the fixed-FOV, center-anchored attitude solve on ONE image.
-    Prints RA/Dec and returns a dict with pose, matches, etc.
+    Star identification + QUEST attitude determination
+    Pipeline: Detection → RANSAC matching → QUEST final attitude
     """
-    res = solve_one_image_fixed_fov(
-        catalog_path, image_path, fov_deg,
-        fov_is_vertical=fov_is_vertical,
-        mag_limit=mag_limit, max_image_stars=max_image_stars,
-        k_desc=k_desc, top_m=top_m,
-        ang_gate_deg=ang_gate_deg,
-        px_gate_seed=px_gate_seed,
-        px_gate_assign=px_gate_assign,
-        refine_loops=refine_loops,
-        seed=seed,
-        annotate_suffix=annotate_suffix
-    )
+    random.seed(seed); np.random.seed(seed)
 
-    if res is None:
-        print("[single-fixedFOV] Failed to solve attitude for this image.")
+    print(f"\n{'='*80}")
+    print(f"STAR IDENTIFICATION AND ATTITUDE DETERMINATION WITH QUEST")
+    print(f"{'='*80}")
+    
+    # Detection
+    print(f"\n[STEP 1] Detecting stars in {image_path}")
+    stars_all, W, H = detect_stars(image_path, threshold_rel=0.60, min_area=2, dedupe_px=2.0)
+    stars = stars_all[:max_image_stars]
+    print(f"[INFO] Image size: {W} x {H} pixels")
+    print(f"[INFO] Using {len(stars)} brightest stars (from {len(stars_all)} detected)")
+    
+    if len(stars) < 6:
+        print(f"[ERROR] Too few detections in {image_path}")
         return None
 
-    print("[single-fixedFOV] Done.")
-    print(f"  RA  = {res['ra_deg']:.4f}°")
-    print(f"  Dec = {res['dec_deg']:.4f}°")
-    print(f"  Matched {len(res['matches'])} stars (of {len(res['stars'])} used)")
+    # Fixed intrinsics from FOV
+    print(f"\n[STEP 2] Camera model setup")
+    f, cx, cy = intrinsics_from_fov(W, H, fov_deg, vertical=fov_is_vertical)
+    fov_type = "vertical" if fov_is_vertical else "horizontal"
+    print(f"[INFO] FOV: {fov_deg}° ({fov_type})")
+    print(f"[INFO] Focal length: {f:.1f} pixels")
+    print(f"[INFO] Principal point: ({cx:.1f}, {cy:.1f})")
 
-    return res
+    # Catalog and descriptors
+    print(f"\n[STEP 3] Loading catalog and computing descriptors")
+    catalog = parse_catalog(catalog_path, mag_limit=mag_limit)
+    D_img, _, _ = build_image_descriptors(stars, k=k_desc)
+    D_cat, _, ccoords = build_catalog_descriptors(catalog, k=k_desc, neighbor_max_deg=70.0)
+    cand = candidate_catalog_for_image(D_img, D_cat, top_m=top_m)
+    print(f"[INFO] Using {len(catalog)} catalog stars with V ≤ {mag_limit}")
 
-# ---------------- Example usage (uncomment to run directly) ----------------
+    # Seed pose
+    print(f"\n[STEP 4] Initial pose estimation via RANSAC")
+    best = ransac_seed_fixed_f(stars, cand, catalog, ccoords,
+                               f, cx, cy,
+                               trials=4000, min_inliers=4,
+                               ang_gate_deg=ang_gate_deg, px_gate=px_gate_seed, seed=seed)
+    if not best or best["score"] < 3:
+        print(f"[ERROR] No initial pose found for {image_path}")
+        return None
+    print(f"[INFO] Initial seed found {best['score']} matches")
+
+    # Star matching (single pass)
+    print(f"\n[STEP 5] Final star matching")
+    matches = hungarian_assign_desc(best["R"], best["f"], best["cx"], best["cy"], best["variant"],
+                                    stars, catalog, W, H,
+                                    cand, px_gate=px_gate_assign, ang_gate_deg=ang_gate_deg,
+                                    w_pos=1.0, w_brightness=0.12)
+    matches = pairwise_prune(matches, stars, catalog, best["R"], best["f"], best["cx"], best["cy"], best["variant"],
+                             tol_deg=0.25, min_support=2)
+    print(f"[INFO] Found {len(matches)} robust star matches")
+
+    if len(matches) < 3:
+        print(f"[ERROR] Insufficient final matches: {len(matches)}")
+        return None
+
+    # QUEST attitude determination (final solution)
+    print(f"\n[STEP 6] QUEST attitude determination (final solution)")
+    print(f"[INFO] Computing optimal attitude from {len(matches)} star matches")
+    
+    # Prepare vectors for QUEST
+    F = flip_matrix(best["variant"])
+    body_vectors = []
+    inertial_vectors = []
+    matched_star_ids = []
+    
+    for i, j in matches:
+        # Body vector (camera ray)
+        ray = pixel_to_ray_stereo_f(stars[i]["x"], stars[i]["y"], cx, cy, f)
+        body_vec = F @ ray
+        body_vectors.append(body_vec)
+        
+        # Inertial vector (catalog star direction)
+        inertial_vectors.append(catalog[j]["vec"])
+        matched_star_ids.append(catalog[j]["id"])
+
+    body_vectors = np.array(body_vectors)
+    inertial_vectors = np.array(inertial_vectors)
+    
+    # Brightness-based weights
+    matched_brightnesses = [stars[i]["brightness"] for i, j in matches]
+    weights = np.array(matched_brightnesses)
+    weights = weights / np.sum(weights)
+
+    # Run QUEST
+    q_quest, lambda_max, quest_iterations = QUEST.quest_method(
+        body_vectors, inertial_vectors, weights=weights, tol=1e-12, max_iter=50)
+    
+    # Convert to rotation matrix
+    R_quest = quaternion_to_rotation_matrix(q_quest)
+    
+    # Calculate errors
+    residuals = []
+    for i, (body_vec, inertial_vec) in enumerate(zip(body_vectors, inertial_vectors)):
+        predicted = R_quest @ body_vec
+        error_rad = np.arccos(np.clip(np.dot(predicted, inertial_vec), -1, 1))
+        residuals.append(np.degrees(error_rad))
+
+    # Boresight calculation
+    boresight_body = np.array([0, 0, 1.0])  # Camera Z-axis
+    boresight_world = R_quest @ (F @ boresight_body)
+    boresight_world /= (np.linalg.norm(boresight_world) + 1e-12)
+    
+    bx, by, bz = boresight_world
+    dec = math.degrees(math.asin(np.clip(bz, -1, 1)))
+    ra = (math.degrees(math.atan2(by, bx)) % 360.0)
+    
+    # Euler angles
+    roll, pitch, yaw = rotation_matrix_to_euler(R_quest)
+
+    # Results summary
+    print(f"\n{'='*80}")
+    print(f"FINAL ATTITUDE DETERMINATION RESULTS")
+    print(f"{'='*80}")
+    print(f"Method: QUEST algorithm (optimal solution)")
+    print(f"Stars matched: {len(matches)}/{len(stars)} used stars")
+    print(f"Matched star IDs: {', '.join(matched_star_ids[:10])}{'...' if len(matched_star_ids) > 10 else ''}")
+    print(f"\nBORESIGHT (Image Center):")
+    print(f"  RA:  {ra:.6f}°")
+    print(f"  Dec: {dec:.6f}°")
+    print(f"\nQUATERNION (w, x, y, z):")
+    print(f"  [{q_quest[0]:.8f}, {q_quest[1]:.8f}, {q_quest[2]:.8f}, {q_quest[3]:.8f}]")
+    print(f"\nEULER ANGLES:")
+    print(f"  Roll:  {roll:.6f}°")
+    print(f"  Pitch: {pitch:.6f}°")
+    print(f"  Yaw:   {yaw:.6f}°")
+    print(f"\nROTATION MATRIX:")
+    for i in range(3):
+        print(f"  [{R_quest[i,0]:9.6f} {R_quest[i,1]:9.6f} {R_quest[i,2]:9.6f}]")
+    print(f"\nQUEST SOLUTION QUALITY:")
+    print(f"  λ_max: {lambda_max:.10f}")
+    print(f"  Newton-Raphson iterations: {quest_iterations}")
+    print(f"  Mean angular error: {np.mean(residuals):.4f}°")
+    print(f"  Max angular error:  {np.max(residuals):.4f}°")
+    print(f"  RMS angular error:  {np.sqrt(np.mean(np.array(residuals)**2)):.4f}°")
+    print(f"  Min angular error:  {np.min(residuals):.4f}°")
+
+    # Individual star errors
+    print(f"\nINDIVIDUAL STAR MATCHING ERRORS:")
+    for i, (star_id, error) in enumerate(zip(matched_star_ids, residuals)):
+        brightness = matched_brightnesses[i]
+        print(f"  {star_id:>8}: {error:7.3f}° (brightness: {brightness:8.1f})")
+
+    # Annotate image
+    import os
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    output_path = f"{base}{annotate_suffix}"
+    annotate(image_path, stars, matches, catalog, out_path=output_path)
+
+    return {
+        "method": "QUEST",
+        "boresight": boresight_world,
+        "ra_deg": ra,
+        "dec_deg": dec,
+        "quaternion": q_quest,
+        "rotation_matrix": R_quest,
+        "euler_angles": (roll, pitch, yaw),
+        "matches": matches,
+        "matched_star_ids": matched_star_ids,
+        "stars": stars,
+        "f": f, "cx": cx, "cy": cy,
+        "variant": best["variant"],
+        "lambda_max": lambda_max,
+        "quest_iterations": quest_iterations,
+        "angular_errors": residuals,
+        "mean_error": np.mean(residuals),
+        "max_error": np.max(residuals),
+        "rms_error": np.sqrt(np.mean(np.array(residuals)**2)),
+        "min_error": np.min(residuals)
+    }
+
+# Usage example
 if __name__ == "__main__":
-    catalog_txt = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\hipparcos_N3.txt"
-    image_png   = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\stellarium_image.png"
-    solve_single_image_fixed_fov(
-        catalog_txt, image_png,
+    catalog_txt = r"c:\Users\157205\Desktop\SPARCS-main\HipparcosCatalog.txt"
+    image1_png = r"c:\Users\157205\Downloads\pov2.png"  # First image
+    image2_png = r"c:\Users\157205\Downloads\pov1.png"  # Second image
+    
+    # Solve both images and calculate angular distance
+    result1, result2, angular_distance = solve_two_images_with_quest(
+        catalog_txt, image1_png, image2_png,
         fov_deg=66.0,
         fov_is_vertical=True,
         mag_limit=3,
@@ -795,27 +1037,17 @@ if __name__ == "__main__":
         px_gate_assign=20.0,
         refine_loops=1,
         seed=7,
-        annotate_suffix="_fixedFOV.png"
+        annotate_suffix="_quest.png"
     )
-
-
-
-# # ---------------- Example call (center-anchored) ----------------
-# if __name__ == "__main__":
-#     catalog_txt = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\hipparcos_N3.txt"
-#     image1_png  = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\pov1.png"
-#     image2_png  = r"C:\Users\kiira\OneDrive\Desktop\Space Challenges\N_Approach\pov2.png"
-
-#     # For your Stellarium setup (stereographic), pass the known vertical FOV if that's what you set.
-#     solve_two_images_fixed_fov(
-#         catalog_txt, image1_png, image2_png,
-#         fov_deg=66.0,          # put your actual vertical FoV here
-#         fov_is_vertical=True,  # set False if your 66° is horizontal instead
-#         mag_limit=3, max_image_stars=26,
-#         k_desc=5, top_m=10,
-#         ang_gate_deg=0.45,
-#         px_gate_seed=22.0,
-#         px_gate_assign=20.0,
-#         refine_loops=1,
-#         seed=7
-#     )
+    
+    # Additional summary
+    if result1 and result2:
+        print(f"\n🎯 FINAL SUMMARY:")
+        print(f"   Quaternion angular distance: {angular_distance:.6f}°")
+        print(f"   📄 Results saved to: attitude_results.txt")
+        print(f"   📊 3D plots: reference_frame_image1.html, reference_frame_image2.html")
+    
+    elif result1:
+        print(f"\n⚠️  Only first image solved successfully")
+    else:
+        print(f"\n❌ Both images failed to solve")
