@@ -238,7 +238,7 @@ def calculate_attitude_quest(measurements_file: str,
         "max_error": float(np.max(residuals)),
         "newton_raphson_iterations": iters2
     }
-
+#ciao
 def print_results(results: dict | None):
     if results is None:
         return
