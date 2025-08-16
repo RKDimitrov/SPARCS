@@ -9,36 +9,39 @@
 # - re-estimates attitude with your QUEST
 # - prints q2_est (scalar-last [qx,qy,qz,qw], inertial->body)
 
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Iterable
+from typing import List, Tuple, Dict, Optional, Iterable, Set
 import numpy as np
 import math
 import importlib.util, sys
+from collections import deque
 
 # =============================================================================
-# Load your Lost-in-Space utilities from the other folder
+# 0) Bring in your existing LiS helpers (star detect, intrinsics, QUEST, etc.)
 # =============================================================================
-module_path = r"C:\Users\mubas\OneDrive\Documents\Modules\Year 1\Endurosat\SPARCS\src\NEW ALTERNATE APPROACH\N approach_2.py"
-module_name = "n_approach_2"
+MODULE_PATH = r"C:\Users\mubas\OneDrive\Documents\Modules\Year 1\Endurosat\SPARCS\src\NEW ALTERNATE APPROACH\N approach_2.py"
+MODULE_NAME = "lis_utils"
 
-spec = importlib.util.spec_from_file_location(module_name, module_path)
+spec = importlib.util.spec_from_file_location(MODULE_NAME, MODULE_PATH)
 lis = importlib.util.module_from_spec(spec)
-sys.modules[module_name] = lis
+sys.modules[MODULE_NAME] = lis
 spec.loader.exec_module(lis)
 
-# LiS helpers
+# LiS utilities we’ll reuse
 QUEST = lis.QUEST
 detect_stars = lis.detect_stars
 parse_catalog = lis.parse_catalog
 intrinsics_from_fov = lis.intrinsics_from_fov
 pixel_to_ray_stereo_f = lis.pixel_to_ray_stereo_f
 ray_to_pixel_stereo_f = lis.ray_to_pixel_stereo_f
-flip_matrix = lis.flip_matrix
+quaternion_angular_distance = lis.quaternion_angular_distance
 
-# =============================== TYPES/CONFIG =================================
-
+# =============================================================================
+# 1) Types & Config
+# =============================================================================
 Vec3 = np.ndarray
-QuatSL = np.ndarray  # scalar-last [qx,qy,qz,qw]
+QuatSL = np.ndarray  # [qx,qy,qz,qw] scalar-last, inertial->body
 
 @dataclass
 class CameraIntrinsics:
@@ -49,48 +52,39 @@ class CameraIntrinsics:
     height: int
 
 @dataclass
-class TrackingConfig:
-    # Your camera uses a VERTICAL FOV. We force vertical axis only.
-    # Angle-space gates (deg), from loose to tight:
-    angle_gate_degs: Tuple[float, ...] = (1.0, 0.6, 0.3)
-    # Inlier refinement gates (deg): after QUEST, drop pairs above these and re-solve
-    refine_gates_deg: Tuple[float, ...] = (0.3, 0.15)
-    # Minimum vectors to run QUEST
+class TrackConfig:
+    neighbors_per_star: int = 9        # paper Sec. 3.2 (≤9)
+    tracking_radius_px: float = 5.0    # paper Sec. 3.3 (d=5 px)
     min_vectors_for_quest: int = 3
-    # Pixel fallback (can introduce bad pairs for tiny motions). Disable by default.
-    use_pixel_fallback: bool = False
-    match_radius_px: float = 20.0  # only used if use_pixel_fallback=True
-    # Try both q1 meanings (safety): I->B (as given) and B->I (conjugate)
-    try_q1_directions: Tuple[str, ...] = ("I2B", "B2I")
-    # Flip variants to try if not forced
-    variants: Tuple[str, ...] = ("normal","flip_x","flip_y","flip_xy")
-    # Optionally force a specific flip variant if you know what LiS used (e.g. "flip_x")
-    force_variant: Optional[str] = None
-    # Catalogue brightness limit (more stars -> easier matching)
     mag_limit: float = 4.5
+    # If your LiS quats are B->I (scalar-last), set this to False to auto-conjugate them.
+    quats_are_I2B: bool = True
+    debug: bool = True
 
-# ============================= QUATERNION UTILS ===============================
-
-def q_sl_normalize(q: QuatSL) -> QuatSL:
-    q = np.asarray(q, float); n = np.linalg.norm(q)
+# =============================================================================
+# 2) Quaternion utilities (scalar-last, I->B)
+# =============================================================================
+def q_norm(q: QuatSL) -> QuatSL:
+    q = np.asarray(q, float)
+    n = np.linalg.norm(q)
     return q if n == 0 else q / n
 
-def q_sl_conj(q: QuatSL) -> QuatSL:
+def q_conj(q: QuatSL) -> QuatSL:
     return np.array([-q[0], -q[1], -q[2], q[3]], float)
 
-def q_sl_mul(q2: QuatSL, q1: QuatSL) -> QuatSL:
-    # Hamilton product, scalar-last
-    x1, y1, z1, w1 = q1; x2, y2, z2, w2 = q2
+def q_mul(q2: QuatSL, q1: QuatSL) -> QuatSL:
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
     v = np.array([
         w2*x1 + x2*w1 + y2*z1 - z2*y1,
         w2*y1 - x2*z1 + y2*w1 + z2*x1,
         w2*z1 + x2*y1 - y2*x1 + z2*w1
-    ])
+    ], float)
     w = w2*w1 - (x2*x1 + y2*y1 + z2*z1)
-    return q_sl_normalize(np.array([*v, w], float))
+    return q_norm(np.array([*v, w], float))
 
-def rotmat_BI_from_q_sl(q_BI: QuatSL) -> np.ndarray:
-    x, y, z, w = q_sl_normalize(q_BI)
+def q_to_dcm_BI(q: QuatSL) -> np.ndarray:
+    x, y, z, w = q_norm(q)
     xx, yy, zz = x*x, y*y, z*z
     xy, xz, yz = x*y, x*z, y*z
     wx, wy, wz = w*x, w*y, w*z
@@ -100,353 +94,382 @@ def rotmat_BI_from_q_sl(q_BI: QuatSL) -> np.ndarray:
         [    2*(xz - wy),     2*(yz + wx), 1 - 2*(xx+yy)]
     ], float)
 
-def q_sf_from_q_sl(q_sl: QuatSL) -> np.ndarray:
-    return np.array([q_sl[3], q_sl[0], q_sl[1], q_sl[2]], float)
+def quat_log(q: QuatSL) -> Vec3:
+    q = q_norm(q)
+    v = q[:3]; w = q[3]
+    nv = np.linalg.norm(v)
+    if nv < 1e-15:
+        return np.zeros(3)
+    theta = 2.0 * math.atan2(nv, w)     # total angle
+    return (theta / nv) * v             # axis*angle
 
-def q_sl_from_q_sf(q_sf: np.ndarray) -> np.ndarray:
-    """[qw,qx,qy,qz] -> [qx,qy,qz,qw] (scalar-last)."""
-    q_sf = np.asarray(q_sf, float)
-    return np.array([q_sf[1], q_sf[2], q_sf[3], q_sf[0]], float)
+def quat_exp(v: Vec3) -> QuatSL:
+    th = float(np.linalg.norm(v))
+    if th < 1e-15:
+        return np.array([0.0,0.0,0.0,1.0], float)
+    u = v / th
+    s = math.sin(th/2.0)
+    return q_norm(np.array([u[0]*s, u[1]*s, u[2]*s, math.cos(th/2.0)], float))
 
-def quat_angle_deg(q1_sl: QuatSL, q2_sl: QuatSL) -> float:
-    q1 = q_sl_normalize(q1_sl); q2 = q_sl_normalize(q2_sl)
-    dot = float(np.clip(abs(q1 @ q2), 0.0, 1.0))
-    return math.degrees(2.0 * math.acos(dot))
+def angular_velocity_from_two_quats(q_nm1: QuatSL, q_n: QuatSL, dt: float) -> Vec3:
+    # q_rel = q_n ⊗ q_{n-1}^* ; ω ≈ (2/dt) * log(q_rel)
+    q_rel = q_mul(q_n, q_conj(q_nm1))
+    v = quat_log(q_rel)
+    return (2.0/dt) * v     # rad/s in body
 
-# ============================ CAMERA PROJECTION ===============================
+def predict_next_quat(q_n: QuatSL, omega_body: Vec3, dt: float) -> QuatSL:
+    # q_{n+1|est} = exp( (dt/2) * ω ) ⊗ q_n
+    q_delta = quat_exp(0.5*dt * omega_body)
+    return q_mul(q_delta, q_n)
 
-def project_body_ray_to_pixel(b_unit: Vec3, K: CameraIntrinsics, variant: str) -> Optional[Tuple[float,float]]:
-    F = flip_matrix(variant)
-    x, y, ok = ray_to_pixel_stereo_f(F @ b_unit, K.cx, K.cy, K.f_pix)
+# =============================================================================
+# 3) Neighbor catalog (≤9 nearest per star)
+# =============================================================================
+def build_neighbor_catalog(catalog: List[dict], k: int = 9) -> Dict[int, List[int]]:
+    R = np.array([s["vec"] for s in catalog], float)  # inertial unit vectors
+    neighbors: Dict[int, List[int]] = {}
+    for i in range(len(catalog)):
+        r0 = R[i]
+        dots = np.clip(R @ r0, -1.0, 1.0)
+        order = np.argsort(-dots)                     # largest dot = smallest angle
+        neigh = [int(j) for j in order if j != i][:k]
+        neighbors[i] = neigh
+    return neighbors
+
+# =============================================================================
+# 4) Imaging model (I -> B -> C -> pixel)
+# =============================================================================
+def inertial_to_pixel(r_i: Vec3, C_BI: np.ndarray, C_CB: np.ndarray, K: CameraIntrinsics) -> Optional[Tuple[float,float]]:
+    v_body = C_BI @ r_i
+    v_body /= (np.linalg.norm(v_body) + 1e-15)
+    v_cam  = C_CB @ v_body
+    x, y, ok = ray_to_pixel_stereo_f(v_cam, K.cx, K.cy, K.f_pix)
     if not ok or x < 0 or x >= K.width or y < 0 or y >= K.height:
         return None
     return (float(x), float(y))
 
-def pixel_to_body_ray(u: float, v: float, K: CameraIntrinsics, variant: str) -> Vec3:
-    F = flip_matrix(variant)
-    return F @ pixel_to_ray_stereo_f(u, v, K.cx, K.cy, K.f_pix)
+def pixel_to_body_ray(u: float, v: float, K: CameraIntrinsics, C_CB: np.ndarray) -> Vec3:
+    v_cam = pixel_to_ray_stereo_f(u, v, K.cx, K.cy, K.f_pix)
+    v_body = C_CB.T @ v_cam
+    return v_body / (np.linalg.norm(v_body) + 1e-15)
 
-# ================================ QUEST WRAP ==================================
+# =============================================================================
+# 5) Predict stars that stay in FOV; robust seeding/fallback
+# =============================================================================
+def predict_star_pixels_next(
+    q_nm1: QuatSL,
+    q_n: QuatSL,
+    dt: float,
+    known_ids_at_n: Iterable[str],   # star IDs identified at step n (LiS output)
+    catalog: List[dict],
+    neighbor_table: Dict[int, List[int]],
+    K: CameraIntrinsics,
+    C_CB: np.ndarray,
+    max_iters: int = 3,
+    debug: bool = False
+) -> Tuple[Dict[int, Tuple[float,float]], QuatSL]:
+    """
+    Returns mapping: cat_index -> predicted (u,v) at n+1, and q_pred.
+    Seeds: stars identified at n. If none found, FALL BACK to projecting the entire catalog.
+    """
+    id_to_idx = {s["id"]: i for i, s in enumerate(catalog)}
 
-def quest_from_pairs(body_vecs: List[np.ndarray], inertial_vecs: List[np.ndarray]) -> np.ndarray:
-    """
-    Calls your QUEST implementation.
-    Input lists are arrays of unit vectors (body/inertial).
-    Returns scalar-last quaternion (inertial->body).
-    """
+    # Predict attitude at n+1 from (n-1,n)
+    omega = angular_velocity_from_two_quats(q_nm1, q_n, dt)   # rad/s
+    q_pred = predict_next_quat(q_n, omega, dt)
+    C_BI = q_to_dcm_BI(q_pred)
+
+    # Try to seed from known IDs
+    queue: deque[int] = deque()
+    visited: Set[int] = set()
+    pred_uv: Dict[int, Tuple[float,float]] = {}
+
+    provided = list(known_ids_at_n)
+    seeds_found = 0
+    for sid in provided:
+        idx = id_to_idx.get(sid, None)
+        if idx is not None:
+            queue.append(idx)
+            seeds_found += 1
+    if debug:
+        print(f"[seed] provided={len(provided)}, found_in_catalog={seeds_found}")
+
+    if seeds_found == 0:
+        # FALLBACK: Project entire catalog once; keep stars that land in FOV
+        for i, s in enumerate(catalog):
+            uv = inertial_to_pixel(np.asarray(s["vec"], float), C_BI, C_CB, K)
+            if uv is not None:
+                pred_uv[i] = uv
+        if debug:
+            print(f"[predict] (fallback: whole-catalog) in-FOV predictions: {len(pred_uv)}")
+        return pred_uv, q_pred
+
+    # BFS growth from seeds (neighbors ≤9)
+    it = 0
+    while queue and it < max_iters:
+        layer_count = len(queue)
+        for _ in range(layer_count):
+            idx = queue.popleft()
+            if idx in visited:
+                continue
+            visited.add(idx)
+
+            uv = inertial_to_pixel(np.asarray(catalog[idx]["vec"], float), C_BI, C_CB, K)
+            if uv is None:
+                continue
+            pred_uv[idx] = uv
+
+            for nb in neighbor_table.get(idx, []):
+                if nb not in visited:
+                    queue.append(nb)
+        it += 1
+
+    if debug:
+        print(f"[predict] predicted {len(pred_uv)} star positions (within FOV).")
+    return pred_uv, q_pred
+
+# =============================================================================
+# 6) Match predicted pixels to measured centroids (d = tracking_radius_px)
+# =============================================================================
+def match_predicted_to_centroids(
+    pred_uv: Dict[int, Tuple[float,float]],
+    centroids: np.ndarray,
+    radius_px: float = 5.0,
+    debug: bool = False
+) -> Dict[int, int]:
+    if centroids.size == 0 or len(pred_uv) == 0:
+        if debug:
+            print(f"[match] skipped (centroids={centroids.size}, predictions={len(pred_uv)})")
+        return {}
+
+    assigned: Dict[int, int] = {}
+    used_centroids: Set[int] = set()
+    r2 = radius_px * radius_px
+
+    items = list(pred_uv.items())
+    # sort by their nearest-possible centroid distance (greedy + stable)
+    dmins = []
+    for idx, (u_pred, v_pred) in items:
+        diffs = centroids - np.array([u_pred, v_pred])[None, :]
+        d2 = np.einsum("ij,ij->i", diffs, diffs)
+        dmins.append((idx, float(np.min(d2))))
+    order = [i for i,_ in sorted(dmins, key=lambda t: t[1])]
+
+    for idx in order:
+        u_pred, v_pred = pred_uv[idx]
+        diffs = centroids - np.array([u_pred, v_pred])[None, :]
+        d2 = np.einsum("ij,ij->i", diffs, diffs)
+        k = int(np.argmin(d2))
+        if d2[k] <= r2 and k not in used_centroids:
+            assigned[idx] = k
+            used_centroids.add(k)
+
+    if debug:
+        print(f"[match] matched {len(assigned)} / {len(pred_uv)} within {radius_px:.1f}px")
+    return assigned
+
+# =============================================================================
+# 7) QUEST solve
+# =============================================================================
+def quest_attitude_from_matches(
+    matches: Dict[int, int],
+    catalog: List[dict],
+    centroids: np.ndarray,
+    K: CameraIntrinsics,
+    C_CB: np.ndarray,
+    min_vectors: int
+) -> Optional[QuatSL]:
+    if len(matches) < min_vectors:
+        return None
+
+    body_vecs: List[Vec3] = []
+    inertial_vecs: List[Vec3] = []
+
+    for cat_idx, c_idx in matches.items():
+        u, v = centroids[c_idx]
+        b_body = pixel_to_body_ray(u, v, K, C_CB)
+        b_body = b_body / (np.linalg.norm(b_body) + 1e-15)
+        r_i = np.asarray(catalog[cat_idx]["vec"], float)
+        r_i = r_i / (np.linalg.norm(r_i) + 1e-15)
+        body_vecs.append(b_body)
+        inertial_vecs.append(r_i)
+
     q_sf, _, _ = QUEST.quest_method(
         body_vectors=np.asarray(body_vecs, float),
         inertial_vectors=np.asarray(inertial_vecs, float),
         weights=None
-    )  # LiS returns scalar-first [w,x,y,z] for Body->Inertial
-    q_sl_B2I = q_sl_from_q_sf(q_sf)   # scalar-last, Body->Inertial
-    q_sl_I2B = q_sl_conj(q_sl_B2I)    # convert to Inertial->Body
-    return q_sl_normalize(q_sl_I2B)
+    )
+    q_sl_B2I = np.array([q_sf[1], q_sf[2], q_sf[3], q_sf[0]], float)
+    q_sl_I2B = q_conj(q_sl_B2I)
+    return q_norm(q_sl_I2B)
 
-# ============================ MATCHING HELPERS ================================
+# =============================================================================
+# 8) End-to-end tracking step
+# =============================================================================
+def tracking_step(
+    q_nm1_sl: QuatSL,                # q at n-1 (I->B, scalar-last) or B->I if cfg.quats_are_I2B=False
+    q_n_sl: QuatSL,                  # q at n   (I->B, scalar-last) or B->I if cfg.quats_are_I2B=False
+    dt: float,
+    known_ids_at_n: Iterable[str],
+    image_np1_path: str,
+    catalog_path: str,
+    fov_deg_vertical: float,
+    C_CB: Optional[np.ndarray] = None,
+    cfg: TrackConfig = TrackConfig()
+) -> Dict[str, object]:
 
-def angle_match(
-    C_BI_pred: np.ndarray,
-    K: CameraIntrinsics,
-    centroids_uv: np.ndarray,
-    catalog_vecs: np.ndarray,
-    variant: str,
-    angle_gate_deg: float
-) -> List[Tuple[int,int]]:
-    """
-    Back-project centroid -> body ray (with F), rotate to inertial (C_BI_pred^T),
-    pick nearest catalog star by angular separation within angle_gate_deg.
-    Returns list of (measured_idx, catalog_subset_idx).
-    """
-    if centroids_uv.size == 0 or catalog_vecs.size == 0:
-        return []
-    C_IB_pred = C_BI_pred.T
-    matches = []
-    used = set()
-    for j, (u, v) in enumerate(centroids_uv):
-        b_meas = pixel_to_body_ray(u, v, K, variant)
-        r_est = C_IB_pred @ b_meas
-        r_est /= (np.linalg.norm(r_est) + 1e-15)
-        dots = catalog_vecs @ r_est
-        k = int(np.argmax(dots))
-        ang = math.degrees(math.acos(float(np.clip(dots[k], -1.0, 1.0))))
-        if ang <= angle_gate_deg and k not in used:
-            used.add(k)
-            matches.append((j, k))
-    return matches
+    # Conventions: flip if the inputs are actually B->I
+    if not cfg.quats_are_I2B:
+        q_nm1_sl = q_conj(q_nm1_sl)
+        q_n_sl   = q_conj(q_n_sl)
 
-def angular_residual_deg(C_BI: np.ndarray, b_meas: Vec3, r_inertial: Vec3) -> float:
-    """
-    Angle between catalog inertial direction and the inertial ray reconstructed
-    from a measured body ray under attitude C_BI:  r_hat = C_IB @ b_meas.
-    """
-    C_IB = C_BI.T
-    r_hat = C_IB @ b_meas
-    r_hat /= (np.linalg.norm(r_hat) + 1e-15)
-    r = r_inertial / (np.linalg.norm(r_inertial) + 1e-15)
-    dot = float(np.clip(np.dot(r_hat, r), -1.0, 1.0))
-    return math.degrees(math.acos(dot))
+    # 1) Centroids
+    stars, img_w, img_h = detect_stars(image_np1_path, threshold_rel=0.60, min_area=2, dedupe_px=2.0)
+    centroids = np.array([[s["x"], s["y"]] for s in stars], float)
+    if cfg.debug:
+        print(f"[detect] centroids: {len(centroids)}  (w,h)=({img_w},{img_h})")
 
-# ================================ TRACKING ====================================
+    # 2) Intrinsics from vertical FOV
+    f_pix, cx, cy = intrinsics_from_fov(img_w, img_h, fov_deg_vertical, vertical=True)
+    K = CameraIntrinsics(f_pix=f_pix, cx=cx, cy=cy, width=img_w, height=img_h)
+    if cfg.debug:
+        fov_rad = math.radians(fov_deg_vertical)
+        px_shift_0p05deg = (math.radians(0.05) * img_h) / fov_rad
+        print(f"[intrinsics] f_pix={f_pix:.2f}  cx,cy=({cx:.1f},{cy:.1f})  ~Δpix(0.05°)≈{px_shift_0p05deg:.2f}px")
 
-def tracking_mode(
-    q1_sl_input: QuatSL,                # hard-coded q1 (scalar-last if direction='I2B')
-    catalog_list: List[dict],           # parse_catalog(...)
-    K_vert: CameraIntrinsics,           # intrinsics from vertical FOV (forced)
-    K_horz: Optional[CameraIntrinsics], # unused (kept for signature compatibility)
-    centroids_img2: np.ndarray,         # (M,2)
-    delta_t: float = 1.0,
-    omega_body: Optional[Vec3] = None,
-    cfg: TrackingConfig = TrackingConfig(),
-    fov_deg_vertical: float = 52.3,
-    fov_deg_horizontal: Optional[float] = None,
-    seed_star_ids: Optional[Iterable[str]] = None   # optional: restrict to stars tracked in frame 1
-):
-    # Prepare catalogue arrays
-    cat_vecs_all = np.array([s["vec"] for s in catalog_list], float)
-    cat_ids_all  = [s["id"] for s in catalog_list]
-    if seed_star_ids is not None:
-        seed_set = set(seed_star_ids)
-        keep_mask = np.array([sid in seed_set for sid in cat_ids_all], bool)
-        if not np.any(keep_mask):
-            keep_mask = np.ones(len(cat_ids_all), bool)  # fall back if seed list empty/mismatched
-        cat_vecs_all = cat_vecs_all[keep_mask]
-        cat_ids_all  = [sid for sid, km in zip(cat_ids_all, keep_mask) if km]
+    # 3) Catalog
+    catalog = parse_catalog(catalog_path, mag_limit=cfg.mag_limit)
+    if cfg.debug:
+        print(f"[catalog] count={len(catalog)} (V ≤ {cfg.mag_limit})")
 
-    # Best-so-far accumulator
-    best = {
-        "q2_est_sl": None,
-        "num_matched": -1,
-        "rms": None,
-        "variant": None,
-        "axis_used": "vertical",  # forced
-        "q1_mode": None
+    # 4) Neighbor table
+    neighbor_table = build_neighbor_catalog(catalog, k=cfg.neighbors_per_star)
+
+    # 5) Camera-from-Body DCM
+    if C_CB is None:
+        C_CB = np.eye(3)
+
+    # 6) Predict star pixels (with robust fallback) + get q_pred (model-only)
+    pred_uv, q_pred = predict_star_pixels_next(
+        q_nm1=q_norm(q_nm1_sl),
+        q_n=q_norm(q_n_sl),
+        dt=dt,
+        known_ids_at_n=known_ids_at_n,
+        catalog=catalog,
+        neighbor_table=neighbor_table,
+        K=K,
+        C_CB=C_CB,
+        max_iters=4,
+        debug=cfg.debug
+    )
+
+    # 7) Match
+    assignments = match_predicted_to_centroids(
+        pred_uv=pred_uv,
+        centroids=centroids,
+        radius_px=cfg.tracking_radius_px,
+        debug=cfg.debug
+    )
+
+    # 8) QUEST (or fallback to q_pred if not enough matches)
+    q_np1_est = quest_attitude_from_matches(
+        matches=assignments,
+        catalog=catalog,
+        centroids=centroids,
+        K=K,
+        C_CB=C_CB,
+        min_vectors=cfg.min_vectors_for_quest
+    )
+    used_fallback = False
+    if q_np1_est is None:
+        # Ensure you always get a quaternion to compare
+        q_np1_est = q_norm(q_pred)
+        used_fallback = True
+        if cfg.debug:
+            print("[quest] not enough pairs — returning model-only q_pred as fallback")
+
+    return {
+        "q_np1_est_sl": q_np1_est,
+        "model_only_q_pred": q_norm(q_pred),
+        "used_model_fallback": used_fallback,
+        "num_tracked": len(assignments),
+        "assignments": assignments,    # cat_idx -> centroid_idx
+        "predicted_uv": pred_uv,       # cat_idx -> (u,v)
+        "centroids": centroids,
+        "K": K,
+        "C_CB": C_CB
     }
 
-    # Force vertical FOV
-    K = K_vert
-    half_fov = 0.5 * fov_deg_vertical
+# =============================================================================
+# 9) Small helper to build C_CB from a LiS variant (optional)
+# =============================================================================
+def build_C_CB_from_variant(perm: Tuple[int,int,int], signs: Tuple[int,int,int]) -> np.ndarray:
+    P = np.zeros((3,3))
+    for r,c in enumerate(perm):
+        P[r,c] = 1.0
+    S = np.diag(list(signs))
+    return S @ P
 
-    # Which flip variants to try
-    variants_to_try = (cfg.force_variant,) if cfg.force_variant else cfg.variants
-
-    # Try both interpretations of q1 (safety)
-    for q1_mode in cfg.try_q1_directions:
-        q1_sl = q_sl_normalize(q1_sl_input if q1_mode == "I2B" else q_sl_conj(q1_sl_input))
-
-        # Motion model (constant ω). For no IMU, identity increment.
-        if omega_body is None or float(np.linalg.norm(omega_body)) < 1e-12:
-            q_delta = np.array([0.0,0.0,0.0,1.0], float)
-        else:
-            theta = float(np.linalg.norm(omega_body) * delta_t)
-            u = omega_body / (np.linalg.norm(omega_body) + 1e-15)
-            s = math.sin(theta/2.0)
-            q_delta = q_sl_normalize(np.array([u[0]*s, u[1]*s, u[2]*s, math.cos(theta/2.0)], float))
-
-        q_pred_sl = q_sl_mul(q_delta, q1_sl)
-        C_BI_pred = rotmat_BI_from_q_sl(q_pred_sl)
-
-        for variant in variants_to_try:
-            F = flip_matrix(variant)
-
-            # Predict which catalogue stars are inside the FOV using angle from boresight
-            b_cam = (F @ (C_BI_pred @ cat_vecs_all.T)).T  # inertial->body->camera
-            bz = b_cam[:,2]
-            ang_from_bore = np.degrees(np.arccos(np.clip(bz, -1.0, 1.0)))
-            keep = ang_from_bore <= (half_fov * 1.05)  # small slack
-            cat_subset = cat_vecs_all[keep]
-            if cat_subset.size == 0:
-                continue
-
-            # Sweep angular gates from tight to tighter (avoid wrong pairs)
-            chosen_pairs = None
-            for gate in cfg.angle_gate_degs:
-                pairs = angle_match(C_BI_pred, K, centroids_img2, cat_subset, variant, gate)
-                if len(pairs) >= cfg.min_vectors_for_quest:
-                    chosen_pairs = pairs
-                    break
-
-            body_vecs: List[np.ndarray] = []
-            inertial_vecs: List[np.ndarray] = []
-            pairs_for_rms: List[Tuple[float,float,np.ndarray]] = []
-
-            # ANGLE-SPACE pairs (preferred)
-            if chosen_pairs:
-                for j_meas, k_sub in chosen_pairs:
-                    u, v = centroids_img2[j_meas]
-                    b_meas = pixel_to_body_ray(u, v, K, variant)
-                    b_meas /= (np.linalg.norm(b_meas) + 1e-15)
-                    r_i = cat_subset[k_sub]
-
-                    body_vecs.append(b_meas)
-                    inertial_vecs.append(r_i)
-                    pairs_for_rms.append((u, v, r_i))
-
-            # PIXEL fallback (optional; disabled by default for tiny motions)
-            if cfg.use_pixel_fallback and len(body_vecs) < cfg.min_vectors_for_quest:
-                proj_xy = []
-                for r_i in cat_subset:
-                    b = C_BI_pred @ r_i
-                    b /= (np.linalg.norm(b) + 1e-15)
-                    px = project_body_ray_to_pixel(b, K, variant)
-                    if px is not None:
-                        proj_xy.append((r_i, px))
-                if proj_xy:
-                    pred_xy = np.array([p for _, p in proj_xy], float)
-                    used = set()
-                    for (u, v) in centroids_img2:
-                        diffs = pred_xy - np.array([u, v])
-                        d2 = np.einsum('ij,ij->i', diffs, diffs)
-                        k = int(np.argmin(d2))
-                        if k in used or d2[k] > cfg.match_radius_px**2:
-                            continue
-                        used.add(k)
-                        r_i = proj_xy[k][0]
-                        b_meas = pixel_to_body_ray(u, v, K, variant)
-                        b_meas /= (np.linalg.norm(b_meas) + 1e-15)
-                        body_vecs.append(b_meas)
-                        inertial_vecs.append(r_i)
-                        pairs_for_rms.append((u, v, r_i))
-
-            # Enough pairs to solve?
-            if len(body_vecs) < cfg.min_vectors_for_quest:
-                continue
-
-            # Initial QUEST solution (convert B->I to I->B inside quest_from_pairs)
-            q_est = quest_from_pairs(body_vecs, inertial_vecs)
-            if (q_est @ q_pred_sl) < 0:
-                q_est = -q_est
-
-            # Inlier refinement loop (drop pairs with big angular residuals and re-solve)
-            for gate_ref in cfg.refine_gates_deg:
-                C_est = rotmat_BI_from_q_sl(q_est)
-                keep_idx = []
-                for idx, (u, v, r_i) in enumerate(pairs_for_rms):
-                    b_meas = pixel_to_body_ray(u, v, K, variant)
-                    b_meas /= (np.linalg.norm(b_meas) + 1e-15)
-                    res = angular_residual_deg(C_est, b_meas, r_i)
-                    if res <= gate_ref:
-                        keep_idx.append(idx)
-
-                if len(keep_idx) >= cfg.min_vectors_for_quest:
-                    body_vecs = [body_vecs[i] for i in keep_idx]
-                    inertial_vecs = [inertial_vecs[i] for i in keep_idx]
-                    pairs_for_rms = [pairs_for_rms[i] for i in keep_idx]
-                    q_est = quest_from_pairs(body_vecs, inertial_vecs)
-                    if (q_est @ q_pred_sl) < 0:
-                        q_est = -q_est
-                else:
-                    break
-
-            # Score by reprojection RMS on actual pairs, prioritising lowest RMS first
-            C_est = rotmat_BI_from_q_sl(q_est)
-            errs = []
-            for (u, v, r_i) in pairs_for_rms:
-                bproj = C_est @ (r_i / (np.linalg.norm(r_i) + 1e-15))
-                bproj /= (np.linalg.norm(bproj) + 1e-15)
-                px = project_body_ray_to_pixel(bproj, K, variant)
-                if px is None:
-                    continue
-                errs.append(math.hypot(px[0] - u, px[1] - v))
-            rms = float(np.sqrt(np.mean(np.array(errs)**2))) if errs else None
-            num_matched = len(pairs_for_rms)
-            effective_rms = rms if rms is not None else 1e9
-            score = (-effective_rms, num_matched)  # prioritise lowest RMS, then more matches
-
-            best_score = (-(best["rms"] if best["rms"] is not None else 1e9), best["num_matched"])
-            if score > best_score:
-                best.update({
-                    "q2_est_sl": q_est,
-                    "num_matched": num_matched,
-                    "rms": rms,
-                    "variant": variant,
-                    "q1_mode": q1_mode
-                })
-
-    # Fallback if nothing worked
-    if best["q2_est_sl"] is None:
-        q1_default = q_sl_normalize(q1_sl_input)
-        best["q2_est_sl"] = q1_default
-        best["num_matched"] = 0
-        best["rms"] = None
-        best["variant"] = None
-        best["q1_mode"] = None
-
-    return best
-
-# ================================== RUN =======================================
-
+# =============================================================================
+# 10) Example main (FILL THE TODOs with your data)
+# =============================================================================
 if __name__ == "__main__":
-    # Paths
-    image2_png = r"C:\Users\mubas\OneDrive\Documents\Modules\Year 1\Endurosat\SPARCS\src\pov2_Track_0.05.png"
-    catalog_csv = r"C:\Users\mubas\OneDrive\Documents\Modules\Year 1\Endurosat\SPARCS\src\HipparcosCatalog.txt"
+    # >>> Two consecutive LiS quaternions; set quats_are_I2B in cfg accordingly <<<
+    q_nm1 = np.array([ 0.70624133, 0.54916346, -0.44337591, 0.05532166], float)  # step n-1
+    q_n   = np.array([ 0.706469, 0.548894, -0.443381, 0.055045], float)  # step n
 
-    # q1 for image 1 (scalar-last, inertial->body)
-    q1_sl_input = np.array([0.37916563, 0.79160741, -0.03189190, -0.47809418], float)
+    DELTA_T = 1.0
 
-    # Detect centroids in image 2
-    stars_img2, img_w, img_h = detect_stars(image2_png, threshold_rel=0.60, min_area=2, dedupe_px=2.0)
-    centroids = np.array([[s["x"], s["y"]] for s in stars_img2], float)
-    print(f"[detect_stars] Found {len(centroids)} candidates.")
+    known_ids_at_n = ["HIP69673", "HIP72105", "HIP76267", "HIP77070", "HIP81377", "HIP72622", "HIP79593", "HIP74785"]
 
-    # Intrinsics: VERTICAL FOV ONLY (forced)
-    FOV_DEG = 52.3
-    f_v, cx_v, cy_v = intrinsics_from_fov(img_w, img_h, FOV_DEG, vertical=True)
-    K_vert = CameraIntrinsics(f_pix=f_v, cx=cx_v, cy=cy_v, width=img_w, height=img_h)
+    image_np1_path = r"C:\Users\mubas\OneDrive\Documents\Modules\Year 1\Endurosat\SPARCS\src\trial_0.05_3.png"
+    catalog_path   = r"C:\Users\mubas\OneDrive\Documents\Modules\Year 1\Endurosat\SPARCS\src\HipparcosCatalog.txt"
+    FOV_DEG_VERTICAL = 52.3
 
-    # Catalog
-    CATALOG_MAG_LIMIT = 4.5
-    catalog = parse_catalog(catalog_csv, mag_limit=CATALOG_MAG_LIMIT)
-    print(f"[parse_catalog] Parsed {len(catalog)} stars (V ≤ {CATALOG_MAG_LIMIT}).")
+    # Set C_CB correctly. If LiS “winner” variant was perm(0,2,1)_sign(-1,1,1):
+    # C_CB = build_C_CB_from_variant((0,2,1), (-1,1,1))
+    C_CB = np.eye(3)
 
-    # Configure tracker:
-    # - Force vertical FOV (done internally)
-    # - Tight angle and refine gates
-    # - Disable pixel fallback for tiny motion
-    # - Optionally force variant to the one LiS used (e.g., "flip_x")
-    cfg = TrackingConfig(
-        angle_gate_degs=(1.0, 0.6, 0.3),
-        refine_gates_deg=(0.3, 0.15),
-        use_pixel_fallback=False,
-        match_radius_px=20.0,
-        try_q1_directions=("I2B", "B2I"),
-        variants=("normal","flip_x","flip_y","flip_xy"),
-        force_variant=None,   # set to "flip_x" if you know LiS used it
-        mag_limit=CATALOG_MAG_LIMIT
+    cfg = TrackConfig(
+        neighbors_per_star=9,
+        tracking_radius_px=5.0,
+        min_vectors_for_quest=3,
+        mag_limit=4.5,
+        quats_are_I2B=True,  # set False if your inputs are actually B->I
+        debug=True
     )
 
-    out = tracking_mode(
-        q1_sl_input=q1_sl_input,
-        catalog_list=catalog,
-        K_vert=K_vert,
-        K_horz=None,                # unused (kept for signature compatibility)
-        centroids_img2=centroids,
-        delta_t=1.0,
-        omega_body=None,            # or provide gyro rate in rad/s
-        cfg=cfg,
-        fov_deg_vertical=FOV_DEG,
-        fov_deg_horizontal=None,
-        seed_star_ids=None          # optionally pass IDs from frame 1 to constrain matching
+    out = tracking_step(
+        q_nm1_sl=q_nm1,
+        q_n_sl=q_n,
+        dt=DELTA_T,
+        known_ids_at_n=known_ids_at_n,
+        image_np1_path=image_np1_path,
+        catalog_path=catalog_path,
+        fov_deg_vertical=FOV_DEG_VERTICAL,
+        C_CB=C_CB,
+        cfg=cfg
     )
 
-    q2_est = out["q2_est_sl"]
-    print("\n=== Tracking Mode Result (Image 2) ===")
-    print(f"Chosen flip variant: {out['variant']}")
-    print(f"FOV axis used: vertical (forced)")
-    print(f"q1 interpretation used: {out['q1_mode']}")
-    print("q1 (scalar-last [qx,qy,qz,qw], I->B):")
-    print(np.array2string(q1_sl_input, precision=8, floatmode='fixed'))
-    print("q2_est (scalar-last [qx,qy,qz,qw], I->B):")
-    print(np.array2string(q2_est, precision=8, floatmode='fixed'))
+    q_est = out["q_np1_est_sl"]
+    q_pred = out["model_only_q_pred"]
 
-    print("\nAngular distance (deg):")
-    print("  angle(q1, q2_est):", f"{quat_angle_deg(q1_sl_input, q2_est):.6f}")
+    print("\n=== Tracking result (n+1) ===")
+    print("Tracked stars:", out["num_tracked"])
+    print("Used model-only fallback:", out["used_model_fallback"])
+    print("Estimated q_{n+1} (I->B, scalar-last):", np.array2string(q_est, precision=8))
+    print("Model-only q_pred (I->B, scalar-last):", np.array2string(q_pred, precision=8))
+    print("Estimated q_{n+1} (I->B, scalar-last):", None if q_est is None else np.array2string(q_est, precision=8))
+# Angular comparisons (only if we got an estimate)
+if q_est is not None:
+    ang_nm1_to_n   = quaternion_angular_distance(q_nm1, q_n)
+    ang_n_to_est   = quaternion_angular_distance(q_n,   q_est)
+    ang_nm1_to_est = quaternion_angular_distance(q_nm1, q_est)
 
-    print("\ntracking stats:",
-          {"num_matched": out["num_matched"], "rms_reproj_px": out["rms"], "chosen_variant": out["variant"]})
-
-
-
-
-
+    print("\n=== Angular comparisons (deg) ===")
+    print(f"angle(q_(n-1), q_n)          : {ang_nm1_to_n:.6f}")
+    print(f"angle(q_n, q_(n+1)_est)      : {ang_n_to_est:.6f}")
+    print(f"angle(q_(n-1), q_(n+1)_est)  : {ang_nm1_to_est:.6f}")
+else:
+    print("\n(No q_(n+1) estimate — skipping angular comparisons.)")
 
